@@ -7,7 +7,7 @@ description = "A fast, tiny ACP (Agent Client Protocol) adapter for the pi codin
 license = "MIT"
 repository = "https://github.com/ahmadaccino/pi-acpinator"
 readme = "README.md"
-keywords = ["acp", "agent-client-protocol", "pi", "llm", "agent"]
+keywords = ["acp", "coding-agent", "pi", "llm", "agent"]
 categories = ["command-line-utilities", "development-tools"]
 exclude = ["npm/", "scripts/", ".github/"]
 
