@@ -40,7 +40,7 @@ Collect `session/update` notifications + the id:3 result (`stopReason`).
 - `M1_5-tools-and-thinking.md` — [DONE] tool_call/tool_call_update mapping, thought streaming, locations.
 - `M2-permission-gate.md` — [DONE] bundled pi extension + `session/request_permission` (the differentiator).
 - `M3-config-and-sessions.md` — [DONE] thinking-level modes, model config option (+ set_config_option), session/load history replay, terminal auth, cancel→Cancelled.
-- `M4-perf-and-benchmarks.md` — [DONE] delta coalescing, pi-exit supervision, outbound backpressure, release profile, benchmark harness. Full incoming backpressure still deferred (between-turn deadlock hazard).
+- `M4-perf-and-benchmarks.md` — [DONE] delta coalescing, pi-exit supervision, bounded outbound + incoming backpressure (fire-and-forget UI events dropped at the reader so the bounded event queue can't deadlock between turns), release profile, benchmark harness.
 - `M5-distribution.md` — [DONE] npm shim + platform packages, cross-build release workflow, CI, cargo metadata.
 - `TESTING.md` — [DONE] unit + transport tests (fake pi via duplex) + deterministic component harness (fake pi drives the real binary over ACP, 12 checks) + live smokes.
 

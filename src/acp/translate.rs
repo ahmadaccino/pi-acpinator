@@ -3,8 +3,8 @@
 use std::path::Path;
 
 use agent_client_protocol::schema::v1::{
-    ContentBlock, ContentChunk, SessionConfigSelectOption, SessionUpdate, TextContent, ToolCall,
-    ToolCallContent, ToolCallId, ToolCallLocation, ToolCallStatus, ToolCallUpdate,
+    ContentBlock, ContentChunk, Diff, SessionConfigSelectOption, SessionUpdate, TextContent,
+    ToolCall, ToolCallContent, ToolCallId, ToolCallLocation, ToolCallStatus, ToolCallUpdate,
     ToolCallUpdateFields, ToolKind,
 };
 use serde_json::Value;
@@ -140,17 +140,64 @@ pub fn tool_locations(args: Option<&Value>, cwd: &Path) -> Vec<ToolCallLocation>
     let mut out = Vec::new();
     for key in ["file_path", "filePath", "path", "file"] {
         if let Some(p) = args.get(key).and_then(Value::as_str) {
-            let path = Path::new(p);
-            let abs = if path.is_absolute() {
-                path.to_path_buf()
-            } else {
-                cwd.join(path)
-            };
-            out.push(ToolCallLocation::new(abs));
+            out.push(ToolCallLocation::new(abs_path(p, cwd)));
             break;
         }
     }
     out
+}
+
+fn abs_path(path: &str, cwd: &Path) -> std::path::PathBuf {
+    let path = Path::new(path);
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        cwd.join(path)
+    }
+}
+
+/// Build a structured diff for an edit/write tool from its start args, so the
+/// client renders the change instead of a plain "wrote N bytes" string.
+pub fn edit_diff(name: &str, args: Option<&Value>, cwd: &Path) -> Option<ToolCallContent> {
+    if !matches!(tool_kind(name), ToolKind::Edit) {
+        return None;
+    }
+    let args = args?;
+    let path = ["path", "file_path", "filePath", "file"]
+        .iter()
+        .find_map(|k| args.get(*k).and_then(Value::as_str))?;
+    let abs = abs_path(path, cwd);
+
+    // write: full new content, no prior text.
+    if let Some(content) = args.get("content").and_then(Value::as_str) {
+        return Some(ToolCallContent::Diff(Diff::new(abs, content)));
+    }
+    // edit: join the replacement fragments into old/new text.
+    if let Some(edits) = args.get("edits").and_then(Value::as_array) {
+        let mut old = String::new();
+        let mut new = String::new();
+        for edit in edits {
+            if let Some(o) = edit.get("oldText").and_then(Value::as_str) {
+                if !old.is_empty() {
+                    old.push('\n');
+                }
+                old.push_str(o);
+            }
+            if let Some(n) = edit.get("newText").and_then(Value::as_str) {
+                if !new.is_empty() {
+                    new.push('\n');
+                }
+                new.push_str(n);
+            }
+        }
+        if old.is_empty() && new.is_empty() {
+            return None;
+        }
+        return Some(ToolCallContent::Diff(
+            Diff::new(abs, new).old_text(Some(old)),
+        ));
+    }
+    None
 }
 
 /// Map pi's available models to ACP select options (value = "<provider>/<id>").
@@ -337,6 +384,46 @@ mod tests {
         let (provider, id) = split_model_value(opts[0].value.0.as_ref()).unwrap();
         assert_eq!(provider, "openrouter");
         assert_eq!(id, "anthropic/claude-3.5");
+    }
+
+    #[test]
+    fn builds_diff_for_write_and_edit() {
+        let w = edit_diff(
+            "write",
+            Some(&serde_json::json!({"path": "a.txt", "content": "hi"})),
+            Path::new("/w"),
+        );
+        match w {
+            Some(ToolCallContent::Diff(d)) => {
+                assert_eq!(d.path, Path::new("/w/a.txt"));
+                assert_eq!(d.new_text, "hi");
+                assert!(d.old_text.is_none());
+            }
+            _ => panic!("expected write diff"),
+        }
+        let e = edit_diff(
+            "edit",
+            Some(
+                &serde_json::json!({"path": "/x/b.txt", "edits": [{"oldText": "a", "newText": "b"}]}),
+            ),
+            Path::new("/w"),
+        );
+        match e {
+            Some(ToolCallContent::Diff(d)) => {
+                assert_eq!(d.path, Path::new("/x/b.txt"));
+                assert_eq!(d.old_text.as_deref(), Some("a"));
+                assert_eq!(d.new_text, "b");
+            }
+            _ => panic!("expected edit diff"),
+        }
+        assert!(
+            edit_diff(
+                "bash",
+                Some(&serde_json::json!({"command": "ls"})),
+                Path::new("/w")
+            )
+            .is_none()
+        );
     }
 
     #[test]

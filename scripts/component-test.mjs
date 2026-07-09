@@ -68,13 +68,14 @@ child.stdout.on("data", (d) => {
         else if (k === "tool_call") histText += "T";
       } else if (k === "agent_message_chunk" && u.content?.text) text += u.content.text;
       else if (k === "agent_thought_chunk" && u.content?.text) thoughts += u.content.text;
-      else if (k === "tool_call") tools.push(["call", u.kind, u.title]);
+      else if (k === "tool_call") { tools.push(["call", u.kind, u.title]); if ((u.content || []).some((c) => c.type === "diff")) tools.push(["diff", u.content.find((c) => c.type === "diff").newText]); }
       else if (k === "tool_call_update") tools.push(["update", u.status]);
     } else if (m.id === 3 && m.result) {
       check("prompt streamed coalesced text", text === "Hello world");
       check("prompt streamed thoughts", thoughts === "pondering");
       check("tool_call emitted as execute", tools.some((t) => t[0] === "call" && t[1] === "execute"));
       check("tool_call completed", tools.some((t) => t[0] === "update" && t[1] === "completed"));
+      check("edit tool surfaces a diff", tools.some((t) => t[0] === "diff" && t[1] === "bar"));
       check("prompt stopReason end_turn", m.result.stopReason === "end_turn");
       send({ jsonrpc: "2.0", id: 4, method: "session/set_mode", params: { sessionId: sid, modeId: "high" } });
     } else if (m.id === 4) {

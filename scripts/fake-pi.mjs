@@ -42,6 +42,10 @@ async function runPrompt() {
   write({ type: "tool_execution_start", toolCallId: "tc1", toolName: "bash", args: { command: "echo hi" } });
   write({ type: "tool_execution_end", toolCallId: "tc1", toolName: "bash", result: { content: [{ type: "text", text: "hi" }] }, isError: false });
   await sleep(5);
+  // an edit tool -> should surface as a structured diff
+  write({ type: "tool_execution_start", toolCallId: "tc2", toolName: "edit", args: { path: "/tmp/x.txt", edits: [{ oldText: "foo", newText: "bar" }] } });
+  write({ type: "tool_execution_end", toolCallId: "tc2", toolName: "edit", result: { content: [{ type: "text", text: "Successfully replaced 1 block(s)" }] }, isError: false });
+  await sleep(5);
   write({ type: "message_update", assistantMessageEvent: { type: "text_delta", delta: " world" } });
   write({ type: "agent_end", willRetry: false });
 }

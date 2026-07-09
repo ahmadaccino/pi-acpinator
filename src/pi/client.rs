@@ -26,6 +26,11 @@ type Pending = Arc<Mutex<HashMap<String, oneshot::Sender<Response>>>>;
 /// instead of letting them buffer without limit.
 const OUTBOUND_CAPACITY: usize = 128;
 
+/// Bounded incoming queue. Safe to bound because fire-and-forget UI events are
+/// dropped at the reader, so only turn-scoped events flow here — which a prompt
+/// is actively draining. Backpressure then correctly slows pi mid-turn.
+const INCOMING_CAPACITY: usize = 512;
+
 /// Handle to a running `pi --mode rpc` process (or an injected transport in tests).
 pub struct PiClient {
     lines: mpsc::Sender<String>,
@@ -34,8 +39,9 @@ pub struct PiClient {
     _child: Option<Child>,
 }
 
-/// Stream of pi events + extension-UI requests (correlated responses removed).
-pub type PiIncoming = mpsc::UnboundedReceiver<Incoming>;
+/// Stream of pi events + dialog extension-UI requests (correlated responses and
+/// fire-and-forget UI noise removed).
+pub type PiIncoming = mpsc::Receiver<Incoming>;
 
 impl PiClient {
     pub async fn spawn(
@@ -120,7 +126,7 @@ impl PiClient {
         });
 
         let pending: Pending = Arc::new(Mutex::new(HashMap::new()));
-        let (evt_tx, evt_rx) = mpsc::unbounded_channel::<Incoming>();
+        let (evt_tx, evt_rx) = mpsc::channel::<Incoming>(INCOMING_CAPACITY);
         let pending_reader = pending.clone();
         tokio::spawn(async move {
             let mut framed = FramedRead::new(stdout, LinesCodec::new());
@@ -134,8 +140,11 @@ impl PiClient {
                             }
                         }
                     }
+                    // Drop fire-and-forget UI requests (setTitle/status/notify/…);
+                    // pi never waits on them, so they must not fill the queue.
+                    Some(Incoming::ExtensionUiRequest(ui)) if !ui.expects_response() => {}
                     Some(other) => {
-                        if evt_tx.send(other).is_err() {
+                        if evt_tx.send(other).await.is_err() {
                             break;
                         }
                     }
@@ -247,6 +256,11 @@ mod tests {
     #[tokio::test]
     async fn forwards_events_and_ui_requests() {
         let (_client, mut incoming, _pi_in, mut pi_out) = wired();
+        // fire-and-forget UI noise is dropped; the confirm dialog passes through.
+        pi_out
+            .write_all(b"{\"type\":\"extension_ui_request\",\"id\":\"0\",\"method\":\"setTitle\",\"title\":\"x\"}\n")
+            .await
+            .unwrap();
         pi_out
             .write_all(b"{\"type\":\"agent_end\",\"willRetry\":false}\n")
             .await
@@ -256,10 +270,10 @@ mod tests {
             .await
             .unwrap();
         assert!(matches!(incoming.recv().await, Some(Incoming::Event(_))));
-        assert!(matches!(
-            incoming.recv().await,
-            Some(Incoming::ExtensionUiRequest(_))
-        ));
+        match incoming.recv().await {
+            Some(Incoming::ExtensionUiRequest(ui)) => assert_eq!(ui.method, "confirm"),
+            other => panic!("expected confirm dialog, got {other:?}"),
+        }
     }
 
     #[tokio::test]

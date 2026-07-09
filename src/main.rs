@@ -18,7 +18,7 @@ use agent_client_protocol::schema::v1::{
     SessionMode, SessionModeId, SessionModeState, SessionNotification, SessionUpdate,
     SetSessionConfigOptionRequest, SetSessionConfigOptionResponse, SetSessionModeRequest,
     SetSessionModeResponse, StopReason, ToolCall, ToolCallId, ToolCallStatus, ToolCallUpdate,
-    ToolCallUpdateFields,
+    ToolCallUpdateFields, ToolKind,
 };
 use agent_client_protocol::{Agent, Client, ConnectionTo, Dispatch, Stdio};
 use tokio::sync::Mutex;
@@ -709,9 +709,12 @@ fn tool_updates(event: &Event, cwd: &Path) -> Vec<SessionUpdate> {
         return Vec::new();
     };
     let call_id = ToolCallId::new(id);
+    let name = event.tool_name.as_deref().unwrap_or("tool");
     match event.kind.as_str() {
         "tool_execution_start" => {
-            let name = event.tool_name.as_deref().unwrap_or("tool");
+            let content: Vec<_> = translate::edit_diff(name, event.args.as_ref(), cwd)
+                .into_iter()
+                .collect();
             vec![SessionUpdate::ToolCall(
                 ToolCall::new(
                     call_id,
@@ -720,7 +723,8 @@ fn tool_updates(event: &Event, cwd: &Path) -> Vec<SessionUpdate> {
                 .kind(translate::tool_kind(name))
                 .status(ToolCallStatus::InProgress)
                 .raw_input(event.args.clone().unwrap_or(serde_json::Value::Null))
-                .locations(translate::tool_locations(event.args.as_ref(), cwd)),
+                .locations(translate::tool_locations(event.args.as_ref(), cwd))
+                .content(content),
             )]
         }
         "tool_execution_update" => {
@@ -737,19 +741,25 @@ fn tool_updates(event: &Event, cwd: &Path) -> Vec<SessionUpdate> {
             ))]
         }
         "tool_execution_end" => {
-            let status = if event.is_error.unwrap_or(false) {
+            let is_error = event.is_error.unwrap_or(false);
+            let status = if is_error {
                 ToolCallStatus::Failed
             } else {
                 ToolCallStatus::Completed
             };
-            let content = event
-                .result
-                .as_ref()
-                .map(translate::tool_content)
-                .unwrap_or_default();
+            let mut fields = ToolCallUpdateFields::new().status(status);
+            // For a successful edit, keep the diff emitted at start; otherwise
+            // attach the tool's text result (or error).
+            if is_error || !matches!(translate::tool_kind(name), ToolKind::Edit) {
+                let content = event
+                    .result
+                    .as_ref()
+                    .map(translate::tool_content)
+                    .unwrap_or_default();
+                fields = fields.content(content);
+            }
             vec![SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(
-                call_id,
-                ToolCallUpdateFields::new().status(status).content(content),
+                call_id, fields,
             ))]
         }
         _ => Vec::new(),

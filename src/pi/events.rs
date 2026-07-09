@@ -131,6 +131,18 @@ pub struct ExtensionUiRequest {
     pub options: Option<Vec<String>>,
 }
 
+impl ExtensionUiRequest {
+    /// Whether pi blocks awaiting an `extension_ui_response`. Only dialog methods
+    /// do; `setTitle`/`setStatus`/`notify`/… are fire-and-forget and are dropped
+    /// so they never accumulate in the (bounded) incoming queue.
+    pub fn expects_response(&self) -> bool {
+        matches!(
+            self.method.as_str(),
+            "confirm" | "select" | "input" | "editor" | "custom"
+        )
+    }
+}
+
 /// An agent session event streamed on pi stdout. Only the fields we translate
 /// are typed; the rest ride along in `extra`.
 #[derive(Debug, Clone, Deserialize)]

@@ -17,7 +17,7 @@ Working today (live-verified against real pi):
 - `session/prompt` — streams assistant output + reasoning as `agent_message_chunk` /
   `agent_thought_chunk`, coalescing delta bursts into far fewer frames
 - tool calls — pi tool execution maps to `tool_call` / `tool_call_update` (kind, status,
-  output, cwd-resolved locations)
+  output, cwd-resolved locations); `write`/`edit` surface as structured diffs
 - `session/request_permission` — a bundled pi extension gates tools via `ctx.ui.confirm`,
   surfaced to the client as ACP permission requests (scope: `off` | `mutating` | `all`)
 - `session/set_mode` — switches pi's thinking level
@@ -26,11 +26,9 @@ Working today (live-verified against real pi):
 - `session/cancel` — aborts the turn and resolves it with `StopReason::Cancelled`
 - fails a turn loudly if pi exits before completing it
 
-Measured (deterministic bench, `node scripts/bench.mjs`): 1.95 MiB binary, ~2.3 ms cold start,
-~0.3 ms time-to-first-token, ~1.2M deltas/s with ~44x delta coalescing, ~5.5 MiB peak RSS.
-
-Deferred (see `plans/`): full incoming-side backpressure (a naive bound risks a between-turn
-deadlock; outbound is bounded today).
+Measured (deterministic bench, `node scripts/bench.mjs`): 1.95 MiB binary, ~3 ms cold start,
+~1M deltas/s with ~45x delta coalescing, ~5.6 MiB peak RSS. Both pi stdin and the event
+stream are bounded, so a slow peer applies backpressure instead of buffering without limit.
 
 ## Install
 
