@@ -7,6 +7,41 @@ It speaks ACP JSON-RPC 2.0 over stdio to any ACP client (e.g. the Zed editor) an
 `pi --mode rpc` underneath. Because it spawns `pi` rather than embedding a JS runtime, the
 adapter is a small native binary — low memory, fast startup.
 
+## Why pi-acpinator?
+
+Every other pi ACP adapter is a Node.js process. `pi-acpinator` is a single native Rust binary,
+so the adapter layer costs almost nothing. Measured head-to-head at the ACP `initialize` stage
+(`node scripts/bench-compare.mjs`, Apple M-series, medians):
+
+| Adapter | Architecture | Cold start | Idle RSS |
+|---|---|---|---|
+| **pi-acpinator** | **Rust native binary, spawns `pi`** | **~4 ms** | **~3 MiB** |
+| [`pi-acp`](https://github.com/svkozak/pi-acp) (svkozak, 472★) | Node, spawns `pi` | ~100 ms | ~76 MiB |
+| [`@victor-software-house/pi-acp`](https://github.com/victor-software-house/pi-acp) | Node, **embeds the pi SDK in-process** + background daemon | heavier still¹ | heavier still¹ |
+
+That's roughly **20× faster startup and ~24× less memory** than the most popular adapter —
+before `pi` itself is even launched. The reasons it wins across the board:
+
+- **No runtime tax.** No Node/V8/Bun to boot or resident — the Node adapters carry ~76 MiB and
+  ~100 ms of runtime overhead *per adapter process*, before doing any work. pi-acpinator is
+  ~3 MiB and starts in single-digit milliseconds.
+- **Process isolation, not embedding.** Like svkozak's, it spawns `pi` as a child (clean
+  lifecycle, `kill_on_drop`). The `victor`/`harms-haus` adapters embed the entire pi Node SDK
+  *inside* the adapter, duplicating the runtime; `victor` additionally needs a separate daemon.
+- **Lower streaming overhead.** Delta bursts are coalesced (~45× fewer ACP frames in the
+  benchmark), both pipes are bounded for backpressure, and a dropped `pi` fails the turn loudly
+  instead of hanging.
+- **More capability, not less.** It implements `session/request_permission` (a real tool
+  permission gate) and a separate `agent_thought_chunk` reasoning stream — both of which the
+  Node adapters document as *not* implemented — plus tool diffs, thinking modes, model
+  selection, and `session/load` history replay.
+- **Trivial to ship and run.** One ~2 MB static binary (musl included): `npx pi-acpinator`,
+  `cargo install pi-acpinator`, or a prebuilt release binary.
+
+¹ `@victor-software-house/pi-acp` embeds the full pi Node SDK and requires a background daemon,
+so its resident footprint is strictly larger than a spawn-based Node adapter; it does not run
+standalone, so it's described architecturally rather than benchmarked here.
+
 ## Status
 
 Working today (live-verified against real pi):
@@ -70,6 +105,7 @@ your model provider / API key.
 cargo test                    # unit + transport tests (framing, translation, coalescing, correlation)
 node scripts/component-test.mjs   # end-to-end component test against a scripted fake pi (no model)
 node scripts/bench.mjs            # performance benchmarks (deterministic)
+node scripts/bench-compare.mjs    # head-to-head vs other pi ACP adapters (installs them)
 RUST_LOG=debug cargo run
 ```
 
