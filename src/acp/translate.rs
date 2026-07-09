@@ -3,7 +3,9 @@
 use std::path::Path;
 
 use agent_client_protocol::schema::v1::{
-    ContentBlock, TextContent, ToolCallContent, ToolCallLocation, ToolKind,
+    ContentBlock, ContentChunk, SessionConfigSelectOption, SessionUpdate, TextContent, ToolCall,
+    ToolCallContent, ToolCallId, ToolCallLocation, ToolCallStatus, ToolCallUpdate,
+    ToolCallUpdateFields, ToolKind,
 };
 use serde_json::Value;
 
@@ -151,6 +153,125 @@ pub fn tool_locations(args: Option<&Value>, cwd: &Path) -> Vec<ToolCallLocation>
     out
 }
 
+/// Map pi's available models to ACP select options (value = "<provider>/<id>").
+pub fn model_options(models: &[Value]) -> Vec<SessionConfigSelectOption> {
+    models
+        .iter()
+        .filter_map(|m| {
+            let id = m.get("id")?.as_str()?;
+            let provider = m.get("provider").and_then(Value::as_str).unwrap_or("");
+            let name = m.get("name").and_then(Value::as_str).unwrap_or(id);
+            Some(SessionConfigSelectOption::new(
+                model_value(provider, id),
+                if provider.is_empty() {
+                    name.to_string()
+                } else {
+                    format!("{name} ({provider})")
+                },
+            ))
+        })
+        .collect()
+}
+
+/// The "<provider>/<id>" value for pi's current model in a get_state payload.
+pub fn current_model_value(state: &Value) -> Option<String> {
+    let model = state.get("model")?;
+    let id = model.get("id")?.as_str()?;
+    let provider = model.get("provider").and_then(Value::as_str).unwrap_or("");
+    Some(model_value(provider, id))
+}
+
+fn model_value(provider: &str, id: &str) -> String {
+    if provider.is_empty() {
+        id.to_string()
+    } else {
+        format!("{provider}/{id}")
+    }
+}
+
+/// Split a "<provider>/<id>" model value back into (provider, modelId). Splits
+/// on the first slash, so model ids that themselves contain slashes survive.
+pub fn split_model_value(value: &str) -> Option<(String, String)> {
+    let (provider, id) = value.split_once('/')?;
+    if provider.is_empty() || id.is_empty() {
+        return None;
+    }
+    Some((provider.to_string(), id.to_string()))
+}
+
+/// Replay a pi message history (from `get_messages`) as ACP session updates.
+pub fn history_updates(messages: &[Value], cwd: &Path) -> Vec<SessionUpdate> {
+    let mut out = Vec::new();
+    for msg in messages {
+        match msg.get("role").and_then(Value::as_str).unwrap_or("") {
+            "user" => {
+                if let Some(text) = joined_text(msg.get("content")) {
+                    out.push(SessionUpdate::UserMessageChunk(ContentChunk::new(
+                        text_block(&text),
+                    )));
+                }
+            }
+            "assistant" => {
+                let Some(parts) = msg.get("content").and_then(Value::as_array) else {
+                    continue;
+                };
+                for part in parts {
+                    match part.get("type").and_then(Value::as_str) {
+                        Some("text") => {
+                            if let Some(t) = part.get("text").and_then(Value::as_str) {
+                                out.push(SessionUpdate::AgentMessageChunk(ContentChunk::new(
+                                    text_block(t),
+                                )));
+                            }
+                        }
+                        Some("toolCall") => {
+                            if let Some(id) = part.get("id").and_then(Value::as_str) {
+                                let name =
+                                    part.get("name").and_then(Value::as_str).unwrap_or("tool");
+                                let args = part.get("arguments");
+                                out.push(SessionUpdate::ToolCall(
+                                    ToolCall::new(ToolCallId::new(id), tool_call_title(name, args))
+                                        .kind(tool_kind(name))
+                                        .status(ToolCallStatus::InProgress)
+                                        .raw_input(args.cloned().unwrap_or(Value::Null))
+                                        .locations(tool_locations(args, cwd)),
+                                ));
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            "toolResult" => {
+                if let Some(id) = msg.get("toolCallId").and_then(Value::as_str) {
+                    let status = if msg.get("isError").and_then(Value::as_bool).unwrap_or(false) {
+                        ToolCallStatus::Failed
+                    } else {
+                        ToolCallStatus::Completed
+                    };
+                    let content = msg.get("content").map(tool_content).unwrap_or_default();
+                    out.push(SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(
+                        ToolCallId::new(id),
+                        ToolCallUpdateFields::new().status(status).content(content),
+                    )));
+                }
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+fn joined_text(content: Option<&Value>) -> Option<String> {
+    let parts = content?.as_array()?;
+    let text: String = parts
+        .iter()
+        .filter(|p| p.get("type").and_then(Value::as_str) == Some("text"))
+        .filter_map(|p| p.get("text").and_then(Value::as_str))
+        .collect();
+    if text.is_empty() { None } else { Some(text) }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -203,5 +324,43 @@ mod tests {
         );
         assert_eq!(locs.len(), 1);
         assert_eq!(locs[0].path, Path::new("/work/src/x.rs"));
+    }
+
+    #[test]
+    fn model_value_roundtrips_through_split() {
+        let opts = model_options(&[serde_json::json!({
+            "id": "anthropic/claude-3.5",
+            "name": "Claude",
+            "provider": "openrouter"
+        })]);
+        assert_eq!(opts.len(), 1);
+        let (provider, id) = split_model_value(opts[0].value.0.as_ref()).unwrap();
+        assert_eq!(provider, "openrouter");
+        assert_eq!(id, "anthropic/claude-3.5");
+    }
+
+    #[test]
+    fn replays_history_in_order() {
+        let msgs = vec![
+            serde_json::json!({"role":"user","content":[{"type":"text","text":"hi"}]}),
+            serde_json::json!({"role":"assistant","content":[
+                {"type":"toolCall","id":"t1","name":"bash","arguments":{"command":"ls"}}
+            ]}),
+            serde_json::json!({"role":"toolResult","toolCallId":"t1","toolName":"bash",
+                "content":[{"type":"text","text":"out"}],"isError":false}),
+            serde_json::json!({"role":"assistant","content":[{"type":"text","text":"done"}]}),
+        ];
+        let updates = history_updates(&msgs, Path::new("/w"));
+        let kinds: Vec<&str> = updates
+            .iter()
+            .map(|u| match u {
+                SessionUpdate::UserMessageChunk(_) => "user",
+                SessionUpdate::AgentMessageChunk(_) => "msg",
+                SessionUpdate::ToolCall(_) => "tool",
+                SessionUpdate::ToolCallUpdate(_) => "tool_update",
+                _ => "other",
+            })
+            .collect();
+        assert_eq!(kinds, ["user", "tool", "tool_update", "msg"]);
     }
 }
