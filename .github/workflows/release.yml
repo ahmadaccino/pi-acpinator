@@ -1,0 +1,99 @@
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+  id-token: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-14
+            target: aarch64-apple-darwin
+            slug: darwin-arm64
+          - os: macos-13
+            target: x86_64-apple-darwin
+            slug: darwin-x64
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            slug: linux-x64
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+            slug: linux-arm64
+            cross: true
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            slug: win32-x64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - name: Install cross toolchain
+        if: matrix.cross
+        uses: taiki-e/setup-cross-toolchain-action@v1
+        with:
+          target: ${{ matrix.target }}
+      - run: cargo build --release --target ${{ matrix.target }}
+      - name: Stage binary
+        shell: bash
+        run: |
+          BIN=target/${{ matrix.target }}/release/pi-acpinator
+          [ "${{ matrix.slug }}" = "win32-x64" ] && BIN="$BIN.exe"
+          mkdir -p dist
+          cp "$BIN" "dist/pi-acpinator-${{ matrix.slug }}$([ "${{ matrix.slug }}" = win32-x64 ] && echo .exe)"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bin-${{ matrix.slug }}
+          path: |
+            target/${{ matrix.target }}/release/pi-acpinator
+            target/${{ matrix.target }}/release/pi-acpinator.exe
+          if-no-files-found: ignore
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+
+  publish-npm:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      - name: Derive version
+        run: echo "VERSION=${GITHUB_REF_NAME#v}" >> "$GITHUB_ENV"
+      - name: Build + publish platform packages
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          set -e
+          declare -A BIN=(
+            [darwin-arm64]=artifacts/bin-darwin-arm64/pi-acpinator
+            [darwin-x64]=artifacts/bin-darwin-x64/pi-acpinator
+            [linux-x64]=artifacts/bin-linux-x64/pi-acpinator
+            [linux-arm64]=artifacts/bin-linux-arm64/pi-acpinator
+            [win32-x64]=artifacts/bin-win32-x64/pi-acpinator.exe
+          )
+          for slug in "${!BIN[@]}"; do
+            node npm/make-platform-package.mjs "$slug" "${BIN[$slug]}" "$VERSION"
+            (cd "npm/@pi-acpinator/$slug" && npm publish --access public)
+          done
+      - name: Publish shim
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          cd npm/pi-acpinator
+          npm version "$VERSION" --no-git-tag-version --allow-same-version
+          npm publish --access public

@@ -17,7 +17,7 @@ use tokio::process::{Child, Command as TokioCommand};
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::codec::{FramedRead, LinesCodec};
 
-use super::events::{parse_line, Command, ExtensionUiResponse, Incoming, Response};
+use super::events::{Command, ExtensionUiResponse, Incoming, Response, parse_line};
 
 type Pending = Arc<Mutex<HashMap<String, oneshot::Sender<Response>>>>;
 
@@ -77,15 +77,14 @@ impl PiClient {
             let mut framed = FramedRead::new(stdout, LinesCodec::new());
             while let Some(Ok(line)) = framed.next().await {
                 match parse_line(&line) {
-                    Some(Incoming::Response(response)) => match response.id.clone() {
-                        Some(id) => {
+                    Some(Incoming::Response(response)) => {
+                        if let Some(id) = response.id.clone() {
                             let waiter = pending_reader.lock().unwrap().remove(&id);
                             if let Some(waiter) = waiter {
                                 let _ = waiter.send(response);
                             }
                         }
-                        None => {}
-                    },
+                    }
                     Some(other) => {
                         if evt_tx.send(other).is_err() {
                             break;

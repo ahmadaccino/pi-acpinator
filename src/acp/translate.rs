@@ -18,8 +18,14 @@ pub fn tool_kind(name: &str) -> ToolKind {
         .split(|c: char| !c.is_ascii_alphanumeric())
         .filter(|t| !t.is_empty())
         .collect();
-    let has = |set: &[&str]| tokens.iter().any(|t| set.contains(&t.to_ascii_lowercase().as_str()));
-    if has(&["edit", "write", "create", "patch", "apply", "replace", "insert", "append"]) {
+    let has = |set: &[&str]| {
+        tokens
+            .iter()
+            .any(|t| set.contains(&t.to_ascii_lowercase().as_str()))
+    };
+    if has(&[
+        "edit", "write", "create", "patch", "apply", "replace", "insert", "append",
+    ]) {
         ToolKind::Edit
     } else if has(&["delete", "rm", "remove", "unlink"]) {
         ToolKind::Delete
@@ -29,7 +35,9 @@ pub fn tool_kind(name: &str) -> ToolKind {
         ToolKind::Read
     } else if has(&["grep", "glob", "find", "search", "ls", "list", "rg"]) {
         ToolKind::Search
-    } else if has(&["bash", "shell", "sh", "exec", "execute", "run", "terminal", "command", "cmd"]) {
+    } else if has(&[
+        "bash", "shell", "sh", "exec", "execute", "run", "terminal", "command", "cmd",
+    ]) {
         ToolKind::Execute
     } else if has(&["fetch", "http", "web", "url", "curl", "download"]) {
         ToolKind::Fetch
@@ -42,7 +50,17 @@ pub fn tool_kind(name: &str) -> ToolKind {
 
 pub fn tool_call_title(name: &str, args: Option<&Value>) -> String {
     let detail = args.and_then(|a| {
-        for key in ["command", "cmd", "file_path", "filePath", "path", "file", "pattern", "query", "url"] {
+        for key in [
+            "command",
+            "cmd",
+            "file_path",
+            "filePath",
+            "path",
+            "file",
+            "pattern",
+            "query",
+            "url",
+        ] {
             if let Some(s) = a.get(key).and_then(Value::as_str) {
                 return Some(s.to_string());
             }
@@ -151,7 +169,10 @@ mod tests {
 
     #[test]
     fn extracts_result_text_shapes() {
-        assert_eq!(tool_result_text(&serde_json::json!("hi")).as_deref(), Some("hi"));
+        assert_eq!(
+            tool_result_text(&serde_json::json!("hi")).as_deref(),
+            Some("hi")
+        );
         assert_eq!(
             tool_result_text(&serde_json::json!({"stdout": "out"})).as_deref(),
             Some("out")
@@ -176,7 +197,10 @@ mod tests {
 
     #[test]
     fn locations_resolve_relative_to_cwd() {
-        let locs = tool_locations(Some(&serde_json::json!({"path": "src/x.rs"})), Path::new("/work"));
+        let locs = tool_locations(
+            Some(&serde_json::json!({"path": "src/x.rs"})),
+            Path::new("/work"),
+        );
         assert_eq!(locs.len(), 1);
         assert_eq!(locs[0].path, Path::new("/work/src/x.rs"));
     }

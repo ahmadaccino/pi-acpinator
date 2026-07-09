@@ -1,6 +1,10 @@
 //! Typed pi `--mode rpc` protocol: commands we send, events/responses we read.
 //! Mirrors the JSONL protocol documented in pi's `docs/rpc.md`.
 
+// Faithful protocol definition: some commands/fields are not wired to a handler
+// yet (model selection, images) but are kept so the surface stays complete.
+#![allow(dead_code)]
+
 use serde::{Deserialize, Serialize};
 
 /// A command sent to pi on stdin (one JSON object per line).

@@ -1,0 +1,31 @@
+{
+  "name": "pi-acpinator",
+  "version": "0.1.0",
+  "description": "A fast, tiny ACP (Agent Client Protocol) adapter for the pi coding agent.",
+  "bin": {
+    "pi-acpinator": "bin/pi-acpinator.js"
+  },
+  "files": [
+    "bin"
+  ],
+  "keywords": [
+    "acp",
+    "agent-client-protocol",
+    "pi",
+    "llm",
+    "agent",
+    "zed"
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ahmadaccino/pi-acpinator.git"
+  },
+  "optionalDependencies": {
+    "@pi-acpinator/darwin-arm64": "0.1.0",
+    "@pi-acpinator/darwin-x64": "0.1.0",
+    "@pi-acpinator/linux-x64": "0.1.0",
+    "@pi-acpinator/linux-arm64": "0.1.0",
+    "@pi-acpinator/win32-x64": "0.1.0"
+  }
+}

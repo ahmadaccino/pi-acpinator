@@ -1,1 +1,5 @@
 /target
+
+# generated platform packages
+npm/@pi-acpinator/
+npm/pi-acpinator/node_modules/

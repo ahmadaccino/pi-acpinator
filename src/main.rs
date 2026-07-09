@@ -5,8 +5,8 @@ mod pi;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use agent_client_protocol::schema::v1::{
@@ -91,8 +91,7 @@ async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "warn".into()),
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "warn".into()),
         )
         .init();
 
@@ -100,7 +99,8 @@ async fn main() -> anyhow::Result<()> {
     let gate = if approval == ApprovalMode::Off {
         None
     } else {
-        let path = std::env::temp_dir().join(format!("pi-acpinator-gate-{}.ts", uuid::Uuid::new_v4()));
+        let path =
+            std::env::temp_dir().join(format!("pi-acpinator-gate-{}.ts", uuid::Uuid::new_v4()));
         std::fs::write(&path, include_str!("../assets/permission-gate.ts"))?;
         Some(GateFile(path))
     };
@@ -228,7 +228,10 @@ async fn main() -> anyhow::Result<()> {
 
 /// Spawn `pi --mode rpc` for a new ACP session and register it. Returns the
 /// session id and the thinking-level modes advertised to the client.
-async fn start_session(state: &State, cwd: PathBuf) -> anyhow::Result<(SessionId, SessionModeState)> {
+async fn start_session(
+    state: &State,
+    cwd: PathBuf,
+) -> anyhow::Result<(SessionId, SessionModeState)> {
     let mut args = vec![
         "--mode".to_string(),
         "rpc".to_string(),
@@ -247,7 +250,13 @@ async fn start_session(state: &State, cwd: PathBuf) -> anyhow::Result<(SessionId
     let (pi, incoming) = PiClient::spawn("pi", &args, &cwd, &env).await?;
     let id = pi.next_id();
     let state_resp = pi
-        .request(Command::GetState { id: Some(id.clone()) }, &id, PI_STATE_TIMEOUT)
+        .request(
+            Command::GetState {
+                id: Some(id.clone()),
+            },
+            &id,
+            PI_STATE_TIMEOUT,
+        )
         .await?;
     let current_level = state_resp
         .data
@@ -260,7 +269,13 @@ async fn start_session(state: &State, cwd: PathBuf) -> anyhow::Result<(SessionId
     if state.config.gate_path.is_some() {
         let id = pi.next_id();
         let resp = pi
-            .request(Command::GetCommands { id: Some(id.clone()) }, &id, PI_STATE_TIMEOUT)
+            .request(
+                Command::GetCommands {
+                    id: Some(id.clone()),
+                },
+                &id,
+                PI_STATE_TIMEOUT,
+            )
             .await?;
         let loaded = resp
             .data
@@ -460,8 +475,10 @@ async fn request_permission(
         .clone()
         .or_else(|| ui.message.clone())
         .unwrap_or_else(|| "Allow tool?".to_string());
-    let tool_call =
-        ToolCallUpdate::new(ToolCallId::new(ui.id.as_str()), ToolCallUpdateFields::new().title(title));
+    let tool_call = ToolCallUpdate::new(
+        ToolCallId::new(ui.id.as_str()),
+        ToolCallUpdateFields::new().title(title),
+    );
     let options = vec![
         PermissionOption::new(
             PermissionOptionId::new("allow"),
@@ -497,15 +514,22 @@ fn tool_updates(event: &Event, cwd: &Path) -> Vec<SessionUpdate> {
         "tool_execution_start" => {
             let name = event.tool_name.as_deref().unwrap_or("tool");
             vec![SessionUpdate::ToolCall(
-                ToolCall::new(call_id, translate::tool_call_title(name, event.args.as_ref()))
-                    .kind(translate::tool_kind(name))
-                    .status(ToolCallStatus::InProgress)
-                    .raw_input(event.args.clone().unwrap_or(serde_json::Value::Null))
-                    .locations(translate::tool_locations(event.args.as_ref(), cwd)),
+                ToolCall::new(
+                    call_id,
+                    translate::tool_call_title(name, event.args.as_ref()),
+                )
+                .kind(translate::tool_kind(name))
+                .status(ToolCallStatus::InProgress)
+                .raw_input(event.args.clone().unwrap_or(serde_json::Value::Null))
+                .locations(translate::tool_locations(event.args.as_ref(), cwd)),
             )]
         }
         "tool_execution_update" => {
-            let content = event.result.as_ref().map(translate::tool_content).unwrap_or_default();
+            let content = event
+                .result
+                .as_ref()
+                .map(translate::tool_content)
+                .unwrap_or_default();
             vec![SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(
                 call_id,
                 ToolCallUpdateFields::new()
@@ -519,7 +543,11 @@ fn tool_updates(event: &Event, cwd: &Path) -> Vec<SessionUpdate> {
             } else {
                 ToolCallStatus::Completed
             };
-            let content = event.result.as_ref().map(translate::tool_content).unwrap_or_default();
+            let content = event
+                .result
+                .as_ref()
+                .map(translate::tool_content)
+                .unwrap_or_default();
             vec![SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(
                 call_id,
                 ToolCallUpdateFields::new().status(status).content(content),
