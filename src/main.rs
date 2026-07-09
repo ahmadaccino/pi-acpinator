@@ -5,6 +5,7 @@ mod pi;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -12,8 +13,9 @@ use agent_client_protocol::schema::v1::{
     AgentCapabilities, CancelNotification, ContentBlock, ContentChunk, InitializeRequest,
     InitializeResponse, NewSessionRequest, NewSessionResponse, PermissionOption,
     PermissionOptionId, PermissionOptionKind, PromptRequest, PromptResponse,
-    RequestPermissionOutcome, RequestPermissionRequest, SessionId, SessionNotification,
-    SessionUpdate, StopReason, ToolCall, ToolCallId, ToolCallStatus, ToolCallUpdate,
+    RequestPermissionOutcome, RequestPermissionRequest, SessionId, SessionMode, SessionModeId,
+    SessionModeState, SessionNotification, SessionUpdate, SetSessionModeRequest,
+    SetSessionModeResponse, StopReason, ToolCall, ToolCallId, ToolCallStatus, ToolCallUpdate,
     ToolCallUpdateFields,
 };
 use agent_client_protocol::{Agent, Client, ConnectionTo, Dispatch, Stdio};
@@ -24,6 +26,8 @@ use crate::pi::client::{PiClient, PiIncoming};
 use crate::pi::events::{Command, Event, ExtensionUiRequest, ExtensionUiResponse, Incoming};
 
 const PI_STATE_TIMEOUT: Duration = Duration::from_secs(5);
+
+const THINKING_LEVELS: [&str; 6] = ["off", "minimal", "low", "medium", "high", "xhigh"];
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ApprovalMode {
@@ -73,6 +77,7 @@ struct Session {
     pi: Arc<PiClient>,
     incoming: Mutex<PiIncoming>,
     cwd: PathBuf,
+    aborted: AtomicBool,
 }
 
 #[derive(Clone)]
@@ -128,7 +133,8 @@ async fn main() -> anyhow::Result<()> {
                 let state = state.clone();
                 async move |req: NewSessionRequest, responder, _conn: ConnectionTo<Client>| {
                     match start_session(&state, req.cwd).await {
-                        Ok(session_id) => responder.respond(NewSessionResponse::new(session_id)),
+                        Ok((session_id, modes)) => responder
+                            .respond(NewSessionResponse::new(session_id).modes(Some(modes))),
                         Err(err) => responder.respond_with_error(
                             agent_client_protocol::util::internal_error(err.to_string()),
                         ),
@@ -170,12 +176,37 @@ async fn main() -> anyhow::Result<()> {
                 let state = state.clone();
                 async move |note: CancelNotification, _conn: ConnectionTo<Client>| {
                     if let Some(session) = state.sessions.lock().await.get(&note.session_id) {
+                        session.aborted.store(true, Ordering::SeqCst);
                         let _ = session.pi.send(Command::Abort { id: None });
                     }
                     Ok(())
                 }
             },
             agent_client_protocol::on_receive_notification!(),
+        )
+        .on_receive_request(
+            {
+                let state = state.clone();
+                async move |req: SetSessionModeRequest, responder, _conn: ConnectionTo<Client>| {
+                    let session = state.sessions.lock().await.get(&req.session_id).cloned();
+                    match session {
+                        Some(session) => {
+                            let _ = session.pi.send(Command::SetThinkingLevel {
+                                id: None,
+                                level: req.mode_id.0.to_string(),
+                            });
+                            responder.respond(SetSessionModeResponse::new())
+                        }
+                        None => responder.respond_with_error(
+                            agent_client_protocol::util::internal_error(format!(
+                                "unknown session: {}",
+                                req.session_id.0
+                            )),
+                        ),
+                    }
+                }
+            },
+            agent_client_protocol::on_receive_request!(),
         )
         .on_receive_dispatch(
             async move |message: Dispatch, cx: ConnectionTo<Client>| match message {
@@ -195,8 +226,9 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Spawn `pi --mode rpc` for a new ACP session and register it.
-async fn start_session(state: &State, cwd: PathBuf) -> anyhow::Result<SessionId> {
+/// Spawn `pi --mode rpc` for a new ACP session and register it. Returns the
+/// session id and the thinking-level modes advertised to the client.
+async fn start_session(state: &State, cwd: PathBuf) -> anyhow::Result<(SessionId, SessionModeState)> {
     let mut args = vec![
         "--mode".to_string(),
         "rpc".to_string(),
@@ -214,8 +246,16 @@ async fn start_session(state: &State, cwd: PathBuf) -> anyhow::Result<SessionId>
 
     let (pi, incoming) = PiClient::spawn("pi", &args, &cwd, &env).await?;
     let id = pi.next_id();
-    pi.request(Command::GetState { id: Some(id.clone()) }, &id, PI_STATE_TIMEOUT)
+    let state_resp = pi
+        .request(Command::GetState { id: Some(id.clone()) }, &id, PI_STATE_TIMEOUT)
         .await?;
+    let current_level = state_resp
+        .data
+        .as_ref()
+        .and_then(|d| d.get("thinkingLevel"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("medium")
+        .to_string();
 
     if state.config.gate_path.is_some() {
         let id = pi.next_id();
@@ -238,9 +278,28 @@ async fn start_session(state: &State, cwd: PathBuf) -> anyhow::Result<SessionId>
             pi: Arc::new(pi),
             incoming: Mutex::new(incoming),
             cwd: cwd.to_path_buf(),
+            aborted: AtomicBool::new(false),
         }),
     );
-    Ok(session_id)
+    Ok((session_id, thinking_modes(&current_level)))
+}
+
+/// Advertise pi's thinking levels as ACP session modes.
+fn thinking_modes(current: &str) -> SessionModeState {
+    let modes = THINKING_LEVELS
+        .iter()
+        .map(|level| {
+            let name = format!("{}{}", level[..1].to_uppercase(), &level[1..]);
+            SessionMode::new(SessionModeId::new(*level), name)
+                .description(Some(format!("Thinking level: {level}")))
+        })
+        .collect();
+    let current = if THINKING_LEVELS.contains(&current) {
+        current
+    } else {
+        "medium"
+    };
+    SessionModeState::new(SessionModeId::new(current), modes)
 }
 
 /// Forward a prompt to pi and stream its output back as ACP session updates,
@@ -251,6 +310,7 @@ async fn run_prompt(
     conn: ConnectionTo<Client>,
 ) -> anyhow::Result<StopReason> {
     let session_id = req.session_id.clone();
+    session.aborted.store(false, Ordering::SeqCst);
     session.pi.send(Command::Prompt {
         id: None,
         message: prompt_text(&req.prompt),
@@ -267,7 +327,11 @@ async fn run_prompt(
                         .send_notification(SessionNotification::new(session_id.clone(), update));
                 }
                 if event.kind == "agent_end" && !event.will_retry.unwrap_or(false) {
-                    return Ok(StopReason::EndTurn);
+                    return Ok(if session.aborted.load(Ordering::SeqCst) {
+                        StopReason::Cancelled
+                    } else {
+                        StopReason::EndTurn
+                    });
                 }
             }
             Incoming::ExtensionUiRequest(ui) => {
