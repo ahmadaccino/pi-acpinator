@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 "use strict";
-// Builds an @pi-acpinator/<platform>-<arch> npm package around a prebuilt
-// binary. Run in CI once per target.
+// Builds an @ahmadsandid/pi-acpinator-<platform>-<arch> npm package around a
+// prebuilt binary. Run in CI once per target.
 //   node npm/make-platform-package.mjs <platform>-<arch> <binary-path> <version>
 // e.g. node npm/make-platform-package.mjs darwin-arm64 target/aarch64-apple-darwin/release/pi-acpinator 0.1.0
 import { mkdirSync, copyFileSync, writeFileSync, chmodSync } from "node:fs";
@@ -15,7 +15,7 @@ if (!slug || !binaryPath || !version) {
 
 const [platform, arch] = slug.split("-");
 const binName = platform === "win32" ? "pi-acpinator.exe" : "pi-acpinator";
-const outDir = join("npm", "@pi-acpinator", slug);
+const outDir = join("npm", "platform", slug);
 const binDir = join(outDir, "bin");
 mkdirSync(binDir, { recursive: true });
 
@@ -26,7 +26,7 @@ writeFileSync(
   join(outDir, "package.json"),
   JSON.stringify(
     {
-      name: `@pi-acpinator/${slug}`,
+      name: `@ahmadsandid/pi-acpinator-${slug}`,
       version,
       description: `pi-acpinator prebuilt binary for ${platform} ${arch}.`,
       license: "MIT",

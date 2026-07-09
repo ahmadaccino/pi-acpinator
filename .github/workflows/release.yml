@@ -95,7 +95,7 @@ jobs:
           )
           for slug in "${!BIN[@]}"; do
             node npm/make-platform-package.mjs "$slug" "${BIN[$slug]}" "$VERSION"
-            (cd "npm/@pi-acpinator/$slug" && npm publish --access public)
+            (cd "npm/platform/$slug" && npm publish --access public)
           done
       - name: Publish shim
         env:

@@ -1,7 +1,7 @@
 /target
 
 # generated platform packages
-npm/@pi-acpinator/
+npm/platform/
 npm/pi-acpinator/node_modules/
 
 # local tool artifacts

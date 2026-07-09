@@ -22,10 +22,10 @@
     "url": "git+https://github.com/ahmadaccino/pi-acpinator.git"
   },
   "optionalDependencies": {
-    "@pi-acpinator/darwin-arm64": "0.1.0",
-    "@pi-acpinator/darwin-x64": "0.1.0",
-    "@pi-acpinator/linux-x64": "0.1.0",
-    "@pi-acpinator/linux-arm64": "0.1.0",
-    "@pi-acpinator/win32-x64": "0.1.0"
+    "@ahmadsandid/pi-acpinator-darwin-arm64": "0.1.0",
+    "@ahmadsandid/pi-acpinator-darwin-x64": "0.1.0",
+    "@ahmadsandid/pi-acpinator-linux-x64": "0.1.0",
+    "@ahmadsandid/pi-acpinator-linux-arm64": "0.1.0",
+    "@ahmadsandid/pi-acpinator-win32-x64": "0.1.0"
   }
 }
