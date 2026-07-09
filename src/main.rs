@@ -319,29 +319,111 @@ async fn run_prompt(
     })?;
 
     let mut incoming = session.incoming.lock().await;
-    while let Some(item) = incoming.recv().await {
-        match item {
-            Incoming::Event(event) => {
-                for update in translate_event(&event, &session.cwd) {
-                    let _ = conn
-                        .send_notification(SessionNotification::new(session_id.clone(), update));
-                }
-                if event.kind == "agent_end" && !event.will_retry.unwrap_or(false) {
-                    return Ok(if session.aborted.load(Ordering::SeqCst) {
-                        StopReason::Cancelled
+    let mut coalescer = Coalescer::default();
+    while let Some(first) = incoming.recv().await {
+        // Drain the burst already queued, coalescing contiguous text/thought
+        // deltas into one chunk without adding latency.
+        let mut item = Some(first);
+        while let Some(current) = item.take() {
+            match current {
+                Incoming::Event(event) => {
+                    if let Some((stream, delta)) = stream_delta(&event) {
+                        if let Some(update) = coalescer.push(stream, delta) {
+                            let _ = conn.send_notification(SessionNotification::new(
+                                session_id.clone(),
+                                update,
+                            ));
+                        }
                     } else {
-                        StopReason::EndTurn
-                    });
+                        flush(&mut coalescer, &conn, &session_id);
+                        for update in tool_updates(&event, &session.cwd) {
+                            let _ = conn.send_notification(SessionNotification::new(
+                                session_id.clone(),
+                                update,
+                            ));
+                        }
+                        if event.kind == "agent_end" && !event.will_retry.unwrap_or(false) {
+                            return Ok(if session.aborted.load(Ordering::SeqCst) {
+                                StopReason::Cancelled
+                            } else {
+                                StopReason::EndTurn
+                            });
+                        }
+                    }
                 }
+                Incoming::ExtensionUiRequest(ui) => {
+                    flush(&mut coalescer, &conn, &session_id);
+                    let response = handle_ui_request(&conn, &session_id, &ui).await;
+                    let _ = session.pi.respond_ui(response);
+                }
+                _ => {}
             }
-            Incoming::ExtensionUiRequest(ui) => {
-                let response = handle_ui_request(&conn, &session_id, &ui).await;
-                let _ = session.pi.respond_ui(response);
-            }
-            _ => {}
+            item = incoming.try_recv().ok();
         }
+        flush(&mut coalescer, &conn, &session_id);
     }
-    Ok(StopReason::EndTurn)
+    // pi closed its stream before a terminal agent_end: surface a failure
+    // instead of a false EndTurn (unless we asked it to abort).
+    flush(&mut coalescer, &conn, &session_id);
+    if session.aborted.load(Ordering::SeqCst) {
+        return Ok(StopReason::Cancelled);
+    }
+    anyhow::bail!("pi ended the stream before completing the turn")
+}
+
+/// Coalesces contiguous assistant text / thought deltas into single chunks.
+#[derive(Default)]
+struct Coalescer {
+    kind: Option<Stream>,
+    buf: String,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Stream {
+    Message,
+    Thought,
+}
+
+impl Coalescer {
+    /// Buffer a delta; if it switches stream kind, return the flush of the
+    /// previous kind so callers can emit it first.
+    fn push(&mut self, kind: Stream, delta: &str) -> Option<SessionUpdate> {
+        let flushed = if self.kind.is_some() && self.kind != Some(kind) {
+            self.take()
+        } else {
+            None
+        };
+        self.kind = Some(kind);
+        self.buf.push_str(delta);
+        flushed
+    }
+
+    fn take(&mut self) -> Option<SessionUpdate> {
+        let kind = self.kind.take()?;
+        if self.buf.is_empty() {
+            return None;
+        }
+        let text = std::mem::take(&mut self.buf);
+        let chunk = ContentChunk::new(translate::text_block(&text));
+        Some(match kind {
+            Stream::Message => SessionUpdate::AgentMessageChunk(chunk),
+            Stream::Thought => SessionUpdate::AgentThoughtChunk(chunk),
+        })
+    }
+}
+
+fn flush(coalescer: &mut Coalescer, conn: &ConnectionTo<Client>, session_id: &SessionId) {
+    if let Some(update) = coalescer.take() {
+        let _ = conn.send_notification(SessionNotification::new(session_id.clone(), update));
+    }
+}
+
+fn stream_delta(event: &Event) -> Option<(Stream, &str)> {
+    if let Some(delta) = event.text_delta() {
+        Some((Stream::Message, delta))
+    } else {
+        event.thinking_delta().map(|delta| (Stream::Thought, delta))
+    }
 }
 
 /// Translate a pi extension-UI request into an ACP permission decision (or
@@ -405,18 +487,8 @@ async fn request_permission(
     }
 }
 
-/// Translate a single pi event into zero or more ACP session updates.
-fn translate_event(event: &Event, cwd: &Path) -> Vec<SessionUpdate> {
-    if let Some(delta) = event.text_delta() {
-        return vec![SessionUpdate::AgentMessageChunk(ContentChunk::new(
-            translate::text_block(delta),
-        ))];
-    }
-    if let Some(delta) = event.thinking_delta() {
-        return vec![SessionUpdate::AgentThoughtChunk(ContentChunk::new(
-            translate::text_block(delta),
-        ))];
-    }
+/// Translate a pi tool-execution event into ACP tool-call updates.
+fn tool_updates(event: &Event, cwd: &Path) -> Vec<SessionUpdate> {
     let Some(id) = event.tool_call_id.as_deref() else {
         return Vec::new();
     };
@@ -469,4 +541,38 @@ fn prompt_text(blocks: &[ContentBlock]) -> String {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn text_of(update: &SessionUpdate) -> (&'static str, String) {
+        match update {
+            SessionUpdate::AgentMessageChunk(c) => ("msg", chunk_text(c)),
+            SessionUpdate::AgentThoughtChunk(c) => ("thought", chunk_text(c)),
+            _ => ("other", String::new()),
+        }
+    }
+
+    fn chunk_text(chunk: &ContentChunk) -> String {
+        match &chunk.content {
+            ContentBlock::Text(t) => t.text.clone(),
+            _ => String::new(),
+        }
+    }
+
+    #[test]
+    fn coalesces_same_kind_and_flushes_on_switch() {
+        let mut c = Coalescer::default();
+        assert!(c.push(Stream::Message, "he").is_none());
+        assert!(c.push(Stream::Message, "llo").is_none());
+        // switching to thought flushes the buffered message
+        let flushed = c.push(Stream::Thought, "hmm").expect("flush on switch");
+        assert_eq!(text_of(&flushed), ("msg", "hello".to_string()));
+        // remaining thought comes out on take
+        let rest = c.take().expect("thought");
+        assert_eq!(text_of(&rest), ("thought", "hmm".to_string()));
+        assert!(c.take().is_none());
+    }
 }
