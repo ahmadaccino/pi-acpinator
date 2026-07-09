@@ -29,6 +29,7 @@ use crate::pi::events::{
 };
 
 const PI_STATE_TIMEOUT: Duration = Duration::from_secs(5);
+const DEFAULT_PERMISSION_TIMEOUT: Duration = Duration::from_secs(300);
 
 const MODEL_CONFIG_ID: &str = "model";
 
@@ -81,6 +82,7 @@ impl Drop for GateFile {
 struct Session {
     pi: Arc<PiClient>,
     incoming: Mutex<PiIncoming>,
+    turn_lock: Mutex<()>,
     cwd: PathBuf,
     aborted: AtomicBool,
 }
@@ -89,6 +91,26 @@ struct Session {
 struct State {
     sessions: Arc<Mutex<HashMap<SessionId, Arc<Session>>>>,
     config: Config,
+}
+
+impl State {
+    async fn session(&self, session_id: &SessionId) -> Option<Arc<Session>> {
+        self.sessions.lock().await.get(session_id).cloned()
+    }
+
+    async fn insert_session(&self, session_id: SessionId, session: Arc<Session>) {
+        self.sessions.lock().await.insert(session_id, session);
+    }
+
+    async fn remove_session_if_same(&self, session_id: &SessionId, session: &Arc<Session>) {
+        let mut sessions = self.sessions.lock().await;
+        if sessions
+            .get(session_id)
+            .is_some_and(|current| Arc::ptr_eq(current, session))
+        {
+            sessions.remove(session_id);
+        }
+    }
 }
 
 #[tokio::main(flavor = "current_thread")]
@@ -173,7 +195,7 @@ async fn main() -> anyhow::Result<()> {
             {
                 let state = state.clone();
                 async move |req: PromptRequest, responder, conn: ConnectionTo<Client>| {
-                    let session = state.sessions.lock().await.get(&req.session_id).cloned();
+                    let session = state.session(&req.session_id).await;
                     let Some(session) = session else {
                         return responder.respond_with_error(
                             agent_client_protocol::util::internal_error(format!(
@@ -183,10 +205,22 @@ async fn main() -> anyhow::Result<()> {
                         );
                     };
                     let task_conn = conn.clone();
+                    let cleanup_state = state.clone();
+                    let cleanup_session = session.clone();
+                    let session_id = req.session_id.clone();
                     conn.spawn(async move {
-                        let stop = run_prompt(session, req, task_conn).await;
-                        let _ = match stop {
-                            Ok(reason) => responder.respond(PromptResponse::new(reason)),
+                        let result = run_prompt(session, req, task_conn).await;
+                        let remove_session = match &result {
+                            Ok(run) => !run.session_alive,
+                            Err(_) => true,
+                        };
+                        if remove_session {
+                            cleanup_state
+                                .remove_session_if_same(&session_id, &cleanup_session)
+                                .await;
+                        }
+                        let _ = match result {
+                            Ok(run) => responder.respond(PromptResponse::new(run.stop_reason)),
                             Err(err) => responder.respond_with_error(
                                 agent_client_protocol::util::internal_error(err.to_string()),
                             ),
@@ -201,7 +235,7 @@ async fn main() -> anyhow::Result<()> {
             {
                 let state = state.clone();
                 async move |note: CancelNotification, _conn: ConnectionTo<Client>| {
-                    if let Some(session) = state.sessions.lock().await.get(&note.session_id) {
+                    if let Some(session) = state.session(&note.session_id).await {
                         session.aborted.store(true, Ordering::SeqCst);
                         let _ = session.pi.send(Command::Abort { id: None }).await;
                     }
@@ -214,23 +248,10 @@ async fn main() -> anyhow::Result<()> {
             {
                 let state = state.clone();
                 async move |req: SetSessionModeRequest, responder, _conn: ConnectionTo<Client>| {
-                    let session = state.sessions.lock().await.get(&req.session_id).cloned();
-                    match session {
-                        Some(session) => {
-                            let _ = session
-                                .pi
-                                .send(Command::SetThinkingLevel {
-                                    id: None,
-                                    level: req.mode_id.0.to_string(),
-                                })
-                                .await;
-                            responder.respond(SetSessionModeResponse::new())
-                        }
-                        None => responder.respond_with_error(
-                            agent_client_protocol::util::internal_error(format!(
-                                "unknown session: {}",
-                                req.session_id.0
-                            )),
+                    match set_session_mode(&state, &req).await {
+                        Ok(()) => responder.respond(SetSessionModeResponse::new()),
+                        Err(err) => responder.respond_with_error(
+                            agent_client_protocol::util::internal_error(err.to_string()),
                         ),
                     }
                 }
@@ -377,16 +398,38 @@ async fn start_session(state: &State, cwd: PathBuf) -> anyhow::Result<(SessionId
     let session_id = uuid::Uuid::new_v4().to_string();
     let (pi, incoming, setup) = spawn_pi(&state.config, &cwd, &session_id).await?;
     let session_id = SessionId::new(session_id);
-    state.sessions.lock().await.insert(
-        session_id.clone(),
-        Arc::new(Session {
-            pi: Arc::new(pi),
-            incoming: Mutex::new(incoming),
-            cwd: cwd.clone(),
-            aborted: AtomicBool::new(false),
-        }),
-    );
+    state
+        .insert_session(
+            session_id.clone(),
+            Arc::new(Session {
+                pi: Arc::new(pi),
+                incoming: Mutex::new(incoming),
+                turn_lock: Mutex::new(()),
+                cwd: cwd.clone(),
+                aborted: AtomicBool::new(false),
+            }),
+        )
+        .await;
     Ok((session_id, setup))
+}
+
+async fn spawn_loaded_session(
+    state: &State,
+    req: &LoadSessionRequest,
+) -> anyhow::Result<(Arc<Session>, SessionSetup)> {
+    let (pi, incoming, setup) =
+        spawn_pi(&state.config, &req.cwd, req.session_id.0.as_ref()).await?;
+    let session = Arc::new(Session {
+        pi: Arc::new(pi),
+        incoming: Mutex::new(incoming),
+        turn_lock: Mutex::new(()),
+        cwd: req.cwd.clone(),
+        aborted: AtomicBool::new(false),
+    });
+    state
+        .insert_session(req.session_id.clone(), session.clone())
+        .await;
+    Ok((session, setup))
 }
 
 /// Resume a persisted pi session, replay its history to the client, and register
@@ -397,32 +440,22 @@ async fn load_session(
     req: &LoadSessionRequest,
     conn: &ConnectionTo<Client>,
 ) -> anyhow::Result<SessionSetup> {
-    let existing = state.sessions.lock().await.get(&req.session_id).cloned();
+    let existing = state.session(&req.session_id).await;
     let (session, setup) = match existing {
-        Some(session) => {
-            let setup = session_setup(&session.pi).await?;
-            (session, setup)
-        }
-        None => {
-            let (pi, incoming, setup) =
-                spawn_pi(&state.config, &req.cwd, req.session_id.0.as_ref()).await?;
-            let session = Arc::new(Session {
-                pi: Arc::new(pi),
-                incoming: Mutex::new(incoming),
-                cwd: req.cwd.clone(),
-                aborted: AtomicBool::new(false),
-            });
-            state
-                .sessions
-                .lock()
-                .await
-                .insert(req.session_id.clone(), session.clone());
-            (session, setup)
-        }
+        Some(session) => match session_setup(&session.pi).await {
+            Ok(setup) => (session, setup),
+            Err(_) => {
+                state
+                    .remove_session_if_same(&req.session_id, &session)
+                    .await;
+                spawn_loaded_session(state, req).await?
+            }
+        },
+        None => spawn_loaded_session(state, req).await?,
     };
 
     let id = session.pi.next_id();
-    let messages = session
+    let messages = match session
         .pi
         .request(
             Command::GetMessages {
@@ -431,14 +464,65 @@ async fn load_session(
             &id,
             PI_STATE_TIMEOUT,
         )
-        .await?
-        .data
-        .and_then(|d| d.get("messages").and_then(|m| m.as_array().cloned()))
-        .unwrap_or_default();
+        .await
+    {
+        Ok(response) => response,
+        Err(err) => {
+            state
+                .remove_session_if_same(&req.session_id, &session)
+                .await;
+            return Err(err);
+        }
+    }
+    .data
+    .and_then(|d| d.get("messages").and_then(|m| m.as_array().cloned()))
+    .unwrap_or_default();
     for update in translate::history_updates(&messages, &req.cwd) {
         let _ = conn.send_notification(SessionNotification::new(req.session_id.clone(), update));
     }
     Ok(setup)
+}
+
+async fn set_session_mode(state: &State, req: &SetSessionModeRequest) -> anyhow::Result<()> {
+    let level = req.mode_id.0.to_string();
+    if !THINKING_LEVELS.contains(&level.as_str()) {
+        anyhow::bail!("unknown thinking level: {level}");
+    }
+    let session = state
+        .session(&req.session_id)
+        .await
+        .ok_or_else(|| anyhow::anyhow!("unknown session: {}", req.session_id.0))?;
+
+    let id = session.pi.next_id();
+    let response = match session
+        .pi
+        .request(
+            Command::SetThinkingLevel {
+                id: Some(id.clone()),
+                level: level.clone(),
+            },
+            &id,
+            PI_STATE_TIMEOUT,
+        )
+        .await
+    {
+        Ok(response) => response,
+        Err(err) => {
+            state
+                .remove_session_if_same(&req.session_id, &session)
+                .await;
+            return Err(err);
+        }
+    };
+    if !response.success {
+        anyhow::bail!(
+            "pi rejected thinking level {level}: {}",
+            response
+                .error
+                .unwrap_or_else(|| "unknown error".to_string())
+        );
+    }
+    Ok(())
 }
 
 /// Apply a `session/set_config_option` (currently: the model selector). Awaits
@@ -459,15 +543,12 @@ async fn set_config_option(
     let (provider, model_id) = translate::split_model_value(&value)
         .ok_or_else(|| anyhow::anyhow!("invalid model value: {value}"))?;
     let session = state
-        .sessions
-        .lock()
+        .session(&req.session_id)
         .await
-        .get(&req.session_id)
-        .cloned()
         .ok_or_else(|| anyhow::anyhow!("unknown session: {}", req.session_id.0))?;
 
     let id = session.pi.next_id();
-    let resp = session
+    let resp = match session
         .pi
         .request(
             Command::SetModel {
@@ -478,14 +559,31 @@ async fn set_config_option(
             &id,
             PI_STATE_TIMEOUT,
         )
-        .await?;
+        .await
+    {
+        Ok(resp) => resp,
+        Err(err) => {
+            state
+                .remove_session_if_same(&req.session_id, &session)
+                .await;
+            return Err(err);
+        }
+    };
     if !resp.success {
         anyhow::bail!(
             "pi rejected model {value}: {}",
             resp.error.unwrap_or_else(|| "no API key?".to_string())
         );
     }
-    Ok(session_setup(&session.pi).await?.config_options)
+    match session_setup(&session.pi).await {
+        Ok(setup) => Ok(setup.config_options),
+        Err(err) => {
+            state
+                .remove_session_if_same(&req.session_id, &session)
+                .await;
+            Err(err)
+        }
+    }
 }
 
 /// Build the model selector config option from pi's available models.
@@ -521,13 +619,19 @@ fn thinking_modes(current: &str) -> SessionModeState {
     SessionModeState::new(SessionModeId::new(current), modes)
 }
 
+struct PromptRun {
+    stop_reason: StopReason,
+    session_alive: bool,
+}
+
 /// Forward a prompt to pi and stream its output back as ACP session updates,
 /// bridging permission requests, until pi's turn ends.
 async fn run_prompt(
     session: Arc<Session>,
     req: PromptRequest,
     conn: ConnectionTo<Client>,
-) -> anyhow::Result<StopReason> {
+) -> anyhow::Result<PromptRun> {
+    let _turn = session.turn_lock.lock().await;
     let session_id = req.session_id.clone();
     session.aborted.store(false, Ordering::SeqCst);
     session
@@ -565,10 +669,13 @@ async fn run_prompt(
                             ));
                         }
                         if event.kind == "agent_end" && !event.will_retry.unwrap_or(false) {
-                            return Ok(if session.aborted.load(Ordering::SeqCst) {
-                                StopReason::Cancelled
-                            } else {
-                                StopReason::EndTurn
+                            return Ok(PromptRun {
+                                stop_reason: if session.aborted.load(Ordering::SeqCst) {
+                                    StopReason::Cancelled
+                                } else {
+                                    StopReason::EndTurn
+                                },
+                                session_alive: true,
                             });
                         }
                     }
@@ -588,7 +695,10 @@ async fn run_prompt(
     // instead of a false EndTurn (unless we asked it to abort).
     flush(&mut coalescer, &conn, &session_id);
     if session.aborted.load(Ordering::SeqCst) {
-        return Ok(StopReason::Cancelled);
+        return Ok(PromptRun {
+            stop_reason: StopReason::Cancelled,
+            session_alive: false,
+        });
     }
     anyhow::bail!("pi ended the stream before completing the turn")
 }
@@ -671,6 +781,15 @@ async fn handle_ui_request(
     }
 }
 
+fn permission_timeout() -> Duration {
+    std::env::var("PI_ACPINATOR_PERMISSION_TIMEOUT_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|ms| *ms > 0)
+        .map(Duration::from_millis)
+        .unwrap_or(DEFAULT_PERMISSION_TIMEOUT)
+}
+
 /// Ask the ACP client to approve a tool via `session/request_permission`.
 async fn request_permission(
     conn: &ConnectionTo<Client>,
@@ -699,13 +818,22 @@ async fn request_permission(
         ),
     ];
     let request = RequestPermissionRequest::new(session_id.clone(), tool_call, options);
-    match conn.send_request(request).block_task().await {
-        Ok(response) => matches!(
+    match tokio::time::timeout(
+        permission_timeout(),
+        conn.send_request(request).block_task(),
+    )
+    .await
+    {
+        Ok(Ok(response)) => matches!(
             response.outcome,
             RequestPermissionOutcome::Selected(sel) if sel.option_id.0.starts_with("allow")
         ),
-        Err(err) => {
+        Ok(Err(err)) => {
             tracing::debug!(%err, "permission request failed");
+            false
+        }
+        Err(_) => {
+            tracing::debug!("permission request timed out");
             false
         }
     }
@@ -820,6 +948,42 @@ mod tests {
             ContentBlock::Text(t) => t.text.clone(),
             _ => String::new(),
         }
+    }
+
+    fn fake_session() -> Arc<Session> {
+        let (client_w, _pi_r) = tokio::io::duplex(64);
+        let (_pi_w, client_r) = tokio::io::duplex(64);
+        let (pi, incoming) = PiClient::from_io(client_w, client_r);
+        Arc::new(Session {
+            pi: Arc::new(pi),
+            incoming: Mutex::new(incoming),
+            turn_lock: Mutex::new(()),
+            cwd: PathBuf::from("/tmp"),
+            aborted: AtomicBool::new(false),
+        })
+    }
+
+    #[tokio::test]
+    async fn removes_only_the_session_that_failed() {
+        let state = State {
+            sessions: Arc::new(Mutex::new(HashMap::new())),
+            config: Config {
+                approval: ApprovalMode::Off,
+                gate_path: None,
+            },
+        };
+        let id = SessionId::new("same-id");
+        let stale = fake_session();
+        let replacement = fake_session();
+        state.insert_session(id.clone(), stale.clone()).await;
+        state.insert_session(id.clone(), replacement.clone()).await;
+
+        state.remove_session_if_same(&id, &stale).await;
+        let current = state.session(&id).await.expect("replacement remains");
+        assert!(Arc::ptr_eq(&current, &replacement));
+
+        state.remove_session_if_same(&id, &replacement).await;
+        assert!(state.session(&id).await.is_none());
     }
 
     #[test]

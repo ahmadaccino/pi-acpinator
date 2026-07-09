@@ -1,6 +1,6 @@
 //! Spawns `pi --mode rpc` and speaks its JSONL protocol: a single writer task
 //! drains outgoing command lines to stdin, a reader task frames stdout on `\n`
-//! (byte-level, so it never mis-splits on `U+2028`/`U+2029` inside JSON),
+//! (byte-level, so it never splits on `U+2028`/`U+2029` inside JSON),
 //! correlates `response` frames by id, and forwards events / extension-UI
 //! requests to the caller.
 
@@ -30,6 +30,7 @@ const OUTBOUND_CAPACITY: usize = 128;
 /// dropped at the reader, so only turn-scoped events flow here — which a prompt
 /// is actively draining. Backpressure then correctly slows pi mid-turn.
 const INCOMING_CAPACITY: usize = 512;
+const MAX_LINE_LENGTH: usize = 1024 * 1024;
 
 /// Handle to a running `pi --mode rpc` process (or an injected transport in tests).
 pub struct PiClient {
@@ -69,9 +70,16 @@ impl PiClient {
         let stdout = child.stdout.take().context("pi stdout missing")?;
         if let Some(stderr) = child.stderr.take() {
             tokio::spawn(async move {
-                let mut framed = FramedRead::new(stderr, LinesCodec::new());
-                while let Some(Ok(line)) = framed.next().await {
-                    tracing::debug!(target: "pi", "{line}");
+                let mut framed =
+                    FramedRead::new(stderr, LinesCodec::new_with_max_length(MAX_LINE_LENGTH));
+                while let Some(item) = framed.next().await {
+                    match item {
+                        Ok(line) => tracing::debug!(target: "pi", "{line}"),
+                        Err(err) => {
+                            tracing::debug!(%err, "pi stderr framing failed");
+                            break;
+                        }
+                    }
                 }
             });
         }
@@ -129,8 +137,16 @@ impl PiClient {
         let (evt_tx, evt_rx) = mpsc::channel::<Incoming>(INCOMING_CAPACITY);
         let pending_reader = pending.clone();
         tokio::spawn(async move {
-            let mut framed = FramedRead::new(stdout, LinesCodec::new());
-            while let Some(Ok(line)) = framed.next().await {
+            let mut framed =
+                FramedRead::new(stdout, LinesCodec::new_with_max_length(MAX_LINE_LENGTH));
+            while let Some(item) = framed.next().await {
+                let line = match item {
+                    Ok(line) => line,
+                    Err(err) => {
+                        tracing::debug!(%err, "pi stdout framing failed");
+                        break;
+                    }
+                };
                 match parse_line(&line) {
                     Some(Incoming::Response(response)) => {
                         if let Some(id) = response.id.clone() {
@@ -185,7 +201,10 @@ impl PiClient {
     pub async fn request(&self, command: Command, id: &str, timeout: Duration) -> Result<Response> {
         let (tx, rx) = oneshot::channel();
         self.pending.lock().unwrap().insert(id.to_string(), tx);
-        self.write(&command).await?;
+        if let Err(err) = self.write(&command).await {
+            self.pending.lock().unwrap().remove(id);
+            return Err(err);
+        }
         match tokio::time::timeout(timeout, rx).await {
             Ok(Ok(response)) => Ok(response),
             Ok(Err(_)) => anyhow::bail!("pi closed before responding to `{id}`"),
@@ -293,5 +312,68 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("pi closed"));
+    }
+
+    #[tokio::test]
+    async fn request_cleans_pending_when_writer_is_closed() {
+        let (client, _incoming, pi_in, _pi_out) = wired();
+        drop(pi_in);
+        let _ = client.send(Command::Abort { id: None }).await;
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !client.lines.is_closed() {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .unwrap();
+
+        let id = client.next_id();
+        let err = client
+            .request(
+                Command::GetState {
+                    id: Some(id.clone()),
+                },
+                &id,
+                Duration::from_secs(2),
+            )
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("pi writer closed"));
+        assert!(!client.pending.lock().unwrap().contains_key(&id));
+    }
+
+    #[tokio::test]
+    async fn oversized_stdout_line_fails_pending_requests() {
+        let (client_w, pi_r) = tokio::io::duplex(4096);
+        let (mut pi_w, client_r) = tokio::io::duplex(MAX_LINE_LENGTH + 8192);
+        let (client, _incoming) = PiClient::from_io(client_w, client_r);
+        let pending = client.pending.clone();
+        let id = client.next_id();
+        let request_id = id.clone();
+        let request = tokio::spawn(async move {
+            client
+                .request(
+                    Command::GetState {
+                        id: Some(request_id.clone()),
+                    },
+                    &request_id,
+                    Duration::from_secs(2),
+                )
+                .await
+        });
+
+        let mut pi_in = BufReader::new(pi_r);
+        let mut line = String::new();
+        pi_in.read_line(&mut line).await.unwrap();
+        assert!(line.contains("\"type\":\"get_state\""));
+        let oversized = format!(
+            "{{\"type\":\"message_update\",\"assistantMessageEvent\":{{\"type\":\"text_delta\",\"delta\":\"{}\"}}}}",
+            "x".repeat(MAX_LINE_LENGTH)
+        );
+        let _ = pi_w.write_all(oversized.as_bytes()).await;
+
+        let err = request.await.unwrap().unwrap_err();
+        assert!(err.to_string().contains("pi closed"));
+        assert!(pending.lock().unwrap().is_empty());
     }
 }
