@@ -9,6 +9,13 @@ permissions:
   id-token: write
 
 jobs:
+  publish-crate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo publish --token ${{ secrets.CARGO_REGISTRY_TOKEN }}
+
   build:
     strategy:
       fail-fast: false
