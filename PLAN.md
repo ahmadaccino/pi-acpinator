@@ -6,6 +6,15 @@ stdio to any ACP client (editors, headless agent runners) and drives `pi` undern
 
 Goals, in priority order: **low memory, fast startup, low streaming overhead, correct.**
 
+## Status (current)
+
+**M0 + M1-core: DONE and live-verified** (initialize / session/new spawns `pi --mode rpc` /
+session/prompt streams `agent_message_chunk` / session/cancel). Code in `src/`.
+Remaining milestones are broken into self-contained, code-grounded plans in **`plans/`**:
+`plans/README.md` (index + repo facts + code anchors), `M1_5-tools-and-thinking.md`,
+`M2-permission-gate.md`, `M3-config-and-sessions.md`, `M4-perf-and-benchmarks.md`,
+`M5-distribution.md`, `TESTING.md`. Start there.
+
 ## 0. Language decision: Rust (primary)
 
 Rust is the ideal fit here and directly serves every goal:
