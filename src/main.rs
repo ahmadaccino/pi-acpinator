@@ -1,5 +1,6 @@
 //! pi-acpinator — an ACP agent that drives `pi --mode rpc`.
 
+mod acp;
 mod pi;
 
 use std::collections::HashMap;
@@ -10,19 +11,22 @@ use std::time::Duration;
 use agent_client_protocol::schema::v1::{
     AgentCapabilities, CancelNotification, ContentBlock, ContentChunk, InitializeRequest,
     InitializeResponse, NewSessionRequest, NewSessionResponse, PromptRequest, PromptResponse,
-    SessionId, SessionNotification, SessionUpdate, StopReason,
+    SessionId, SessionNotification, SessionUpdate, StopReason, ToolCall, ToolCallId,
+    ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields,
 };
 use agent_client_protocol::{Agent, Client, ConnectionTo, Dispatch, Result, Stdio};
 use tokio::sync::Mutex;
 
+use crate::acp::translate;
 use crate::pi::client::{PiClient, PiIncoming};
-use crate::pi::events::{Command, Incoming};
+use crate::pi::events::{Command, Event, Incoming};
 
 const PI_STATE_TIMEOUT: Duration = Duration::from_secs(5);
 
 struct Session {
     pi: Arc<PiClient>,
     incoming: Mutex<PiIncoming>,
+    cwd: PathBuf,
 }
 
 #[derive(Default, Clone)]
@@ -126,6 +130,7 @@ async fn start_session(state: &State, cwd: PathBuf) -> anyhow::Result<SessionId>
         Arc::new(Session {
             pi: Arc::new(pi),
             incoming: Mutex::new(incoming),
+            cwd: cwd.to_path_buf(),
         }),
     );
     Ok(session_id)
@@ -159,16 +164,66 @@ async fn run_prompt(
         let Incoming::Event(event) = item else {
             continue;
         };
-        if let Some(delta) = event.text_delta() {
-            let _ = conn.send_notification(SessionNotification::new(
-                req.session_id.clone(),
-                SessionUpdate::AgentMessageChunk(ContentChunk::new(text_block(delta))),
-            ));
-        } else if event.kind == "agent_end" && !event.will_retry.unwrap_or(false) {
+        for update in translate_event(&event, &session.cwd) {
+            let _ = conn.send_notification(SessionNotification::new(req.session_id.clone(), update));
+        }
+        if event.kind == "agent_end" && !event.will_retry.unwrap_or(false) {
             return Ok(StopReason::EndTurn);
         }
     }
     Ok(StopReason::EndTurn)
+}
+
+/// Translate a single pi event into zero or more ACP session updates.
+fn translate_event(event: &Event, cwd: &std::path::Path) -> Vec<SessionUpdate> {
+    if let Some(delta) = event.text_delta() {
+        return vec![SessionUpdate::AgentMessageChunk(ContentChunk::new(
+            translate::text_block(delta),
+        ))];
+    }
+    if let Some(delta) = event.thinking_delta() {
+        return vec![SessionUpdate::AgentThoughtChunk(ContentChunk::new(
+            translate::text_block(delta),
+        ))];
+    }
+    let Some(id) = event.tool_call_id.as_deref() else {
+        return Vec::new();
+    };
+    let call_id = ToolCallId::new(id);
+    match event.kind.as_str() {
+        "tool_execution_start" => {
+            let name = event.tool_name.as_deref().unwrap_or("tool");
+            vec![SessionUpdate::ToolCall(
+                ToolCall::new(call_id, translate::tool_call_title(name, event.args.as_ref()))
+                    .kind(translate::tool_kind(name))
+                    .status(ToolCallStatus::InProgress)
+                    .raw_input(event.args.clone().unwrap_or(serde_json::Value::Null))
+                    .locations(translate::tool_locations(event.args.as_ref(), cwd)),
+            )]
+        }
+        "tool_execution_update" => {
+            let content = event.result.as_ref().map(translate::tool_content).unwrap_or_default();
+            vec![SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(
+                call_id,
+                ToolCallUpdateFields::new()
+                    .status(ToolCallStatus::InProgress)
+                    .content(content),
+            ))]
+        }
+        "tool_execution_end" => {
+            let status = if event.is_error.unwrap_or(false) {
+                ToolCallStatus::Failed
+            } else {
+                ToolCallStatus::Completed
+            };
+            let content = event.result.as_ref().map(translate::tool_content).unwrap_or_default();
+            vec![SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(
+                call_id,
+                ToolCallUpdateFields::new().status(status).content(content),
+            ))]
+        }
+        _ => Vec::new(),
+    }
 }
 
 /// Concatenate the text content blocks of an ACP prompt into a plain message.
@@ -183,8 +238,4 @@ fn prompt_text(blocks: &[ContentBlock]) -> String {
         }
     }
     out
-}
-
-fn text_block(text: &str) -> ContentBlock {
-    ContentBlock::Text(agent_client_protocol::schema::v1::TextContent::new(text))
 }
