@@ -50,7 +50,7 @@ child.stdout.on("data", (d) => {
 
     if (m.id === 1 && m.result) {
       check("initialize advertises loadSession", m.result.agentCapabilities?.loadSession === true);
-      check("initialize advertises auth method", (m.result.authMethods || []).length > 0);
+      check("initialize advertises no auth (pi keys are external)", (m.result.authMethods || []).length === 0);
       send({ jsonrpc: "2.0", id: 2, method: "session/new", params: { cwd: "/tmp", mcpServers: [], additionalDirectories: [] } });
     } else if (m.id === 2 && m.result) {
       sid = m.result.sessionId;

@@ -10,12 +10,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use agent_client_protocol::schema::v1::{
-    AgentCapabilities, AuthMethod, AuthMethodAgent, AuthenticateRequest, AuthenticateResponse,
-    CancelNotification, ContentBlock, ContentChunk, InitializeRequest, InitializeResponse,
-    LoadSessionRequest, LoadSessionResponse, NewSessionRequest, NewSessionResponse,
-    PermissionOption, PermissionOptionId, PermissionOptionKind, PromptRequest, PromptResponse,
-    RequestPermissionOutcome, RequestPermissionRequest, SessionConfigOption, SessionId,
-    SessionMode, SessionModeId, SessionModeState, SessionNotification, SessionUpdate,
+    AgentCapabilities, CancelNotification, ContentBlock, ContentChunk, InitializeRequest,
+    InitializeResponse, LoadSessionRequest, LoadSessionResponse, NewSessionRequest,
+    NewSessionResponse, PermissionOption, PermissionOptionId, PermissionOptionKind, PromptRequest,
+    PromptResponse, RequestPermissionOutcome, RequestPermissionRequest, SessionConfigOption,
+    SessionId, SessionMode, SessionModeId, SessionModeState, SessionNotification, SessionUpdate,
     SetSessionConfigOptionRequest, SetSessionConfigOptionResponse, SetSessionModeRequest,
     SetSessionModeResponse, StopReason, ToolCall, ToolCallId, ToolCallStatus, ToolCallUpdate,
     ToolCallUpdateFields, ToolKind,
@@ -129,18 +128,8 @@ async fn main() -> anyhow::Result<()> {
             async move |req: InitializeRequest, responder, _conn| {
                 responder.respond(
                     InitializeResponse::new(req.protocol_version)
-                        .agent_capabilities(AgentCapabilities::new().load_session(true))
-                        .auth_methods(vec![AuthMethod::Agent(AuthMethodAgent::new(
-                            "pi",
-                            "pi (model provider keys configured via the pi CLI)",
-                        ))]),
+                        .agent_capabilities(AgentCapabilities::new().load_session(true)),
                 )
-            },
-            agent_client_protocol::on_receive_request!(),
-        )
-        .on_receive_request(
-            async move |_req: AuthenticateRequest, responder, _conn: ConnectionTo<Client>| {
-                responder.respond(AuthenticateResponse::new())
             },
             agent_client_protocol::on_receive_request!(),
         )

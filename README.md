@@ -11,7 +11,8 @@ adapter is a small native binary — low memory, fast startup.
 
 Working today (live-verified against real pi):
 
-- `initialize` handshake; advertises `load_session` + a `pi` auth method
+- `initialize` handshake; advertises `load_session` (no auth method — pi provider keys are
+  configured externally via the pi CLI)
 - `session/new` — spawns and supervises a persistent `pi --mode rpc` session; advertises
   pi's thinking levels (`off`..`xhigh`) as session modes and pi's models as a config option
 - `session/prompt` — streams assistant output + reasoning as `agent_message_chunk` /
