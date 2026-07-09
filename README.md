@@ -15,14 +15,17 @@ Working today (live-verified against real pi):
 - `session/new` — spawns and supervises a persistent `pi --mode rpc` session; advertises
   pi's thinking levels (`off`..`xhigh`) as session modes and pi's models as a config option
 - `session/prompt` — streams assistant output + reasoning as `agent_message_chunk` /
-  `agent_thought_chunk`, coalescing delta bursts into far fewer frames
+  `agent_thought_chunk`, coalescing delta bursts into far fewer frames; forwards image
+  content blocks to pi
 - tool calls — pi tool execution maps to `tool_call` / `tool_call_update` (kind, status,
   output, cwd-resolved locations); `write`/`edit` surface as structured diffs
 - `session/request_permission` — a bundled pi extension gates tools via `ctx.ui.confirm`,
   surfaced to the client as ACP permission requests (scope: `off` | `mutating` | `all`)
 - `session/set_mode` — switches pi's thinking level
-- `session/set_config_option` — switches pi's model
-- `session/load` — resumes a persisted session and replays its history to the client
+- `session/set_config_option` — switches pi's model (validated; a bad model / missing key
+  surfaces as an error)
+- `session/load` — resumes a persisted session and replays its history to the client;
+  reuses an already-live session instead of spawning a second pi
 - `session/cancel` — aborts the turn and resolves it with `StopReason::Cancelled`
 - fails a turn loudly if pi exits before completing it
 

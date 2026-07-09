@@ -73,7 +73,8 @@ process.stdin.on("data", (d) => {
         reply("get_messages", m.id, { messages: HISTORY });
         break;
       case "set_model":
-        reply("set_model", m.id, { model: { id: m.modelId, provider: m.provider } });
+        if (m.modelId === "bad") { write({ type: "response", command: "set_model", success: false, id: m.id, error: "no API key for that model" }); }
+        else reply("set_model", m.id, { model: { id: m.modelId, provider: m.provider } });
         break;
       case "set_thinking_level":
         reply("set_thinking_level", m.id, { thinkingLevel: m.level });

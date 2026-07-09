@@ -84,12 +84,15 @@ child.stdout.on("data", (d) => {
       send({ jsonrpc: "2.0", id: 5, method: "session/set_config_option", params: { sessionId: sid, configId: "model", value: cur } });
     } else if (m.id === 5) {
       check("session/set_config_option ok", !!m.result && !m.error);
+      send({ jsonrpc: "2.0", id: 6, method: "session/set_config_option", params: { sessionId: sid, configId: "model", value: "prov/bad" } });
+    } else if (m.id === 6) {
+      check("set_config_option rejects bad model with error", !!m.error);
       loadDone = true;
-      send({ jsonrpc: "2.0", id: 6, method: "session/load", params: { sessionId: sid, cwd: "/tmp", mcpServers: [] } });
-    } else if (m.id === 6 && m.result) {
+      send({ jsonrpc: "2.0", id: 7, method: "session/load", params: { sessionId: sid, cwd: "/tmp", mcpServers: [] } });
+    } else if (m.id === 7 && m.result) {
       check("session/load replays history (user+assistant+tool)", histText.includes("U") && histText.includes("A") && histText.includes("T"));
       finish();
-    } else if ((m.id === 3 || m.id === 6) && m.error) {
+    } else if ((m.id === 3 || m.id === 7) && m.error) {
       check(`request ${m.id} no error`, false);
       finish();
     }

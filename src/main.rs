@@ -25,7 +25,9 @@ use tokio::sync::Mutex;
 
 use crate::acp::translate;
 use crate::pi::client::{PiClient, PiIncoming};
-use crate::pi::events::{Command, Event, ExtensionUiRequest, ExtensionUiResponse, Incoming};
+use crate::pi::events::{
+    Command, Event, ExtensionUiRequest, ExtensionUiResponse, Image, ImageKind, Incoming,
+};
 
 const PI_STATE_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -314,6 +316,32 @@ async fn spawn_pi(
     let program = std::env::var("PI_ACPINATOR_PI_BIN").unwrap_or_else(|_| "pi".to_string());
     let (pi, incoming) = PiClient::spawn(&program, &args, cwd, &env).await?;
 
+    if config.gate_path.is_some() {
+        let id = pi.next_id();
+        let loaded = pi
+            .request(
+                Command::GetCommands {
+                    id: Some(id.clone()),
+                },
+                &id,
+                PI_STATE_TIMEOUT,
+            )
+            .await?
+            .data
+            .map(|d| d.to_string().contains("acp-permission-gate"))
+            .unwrap_or(false);
+        if !loaded {
+            anyhow::bail!("permission gate extension failed to load");
+        }
+    }
+
+    let setup = session_setup(&pi).await?;
+    Ok((pi, incoming, setup))
+}
+
+/// Read pi's current thinking level + models and build the advertised modes and
+/// config options. Also serves as a liveness check.
+async fn session_setup(pi: &PiClient) -> anyhow::Result<SessionSetup> {
     let id = pi.next_id();
     let state = pi
         .request(
@@ -332,26 +360,6 @@ async fn spawn_pi(
         .unwrap_or("medium")
         .to_string();
 
-    if config.gate_path.is_some() {
-        let id = pi.next_id();
-        let resp = pi
-            .request(
-                Command::GetCommands {
-                    id: Some(id.clone()),
-                },
-                &id,
-                PI_STATE_TIMEOUT,
-            )
-            .await?;
-        let loaded = resp
-            .data
-            .map(|d| d.to_string().contains("acp-permission-gate"))
-            .unwrap_or(false);
-        if !loaded {
-            anyhow::bail!("permission gate extension failed to load");
-        }
-    }
-
     let id = pi.next_id();
     let models = pi
         .request(
@@ -366,14 +374,13 @@ async fn spawn_pi(
         .and_then(|d| d.get("models").and_then(|m| m.as_array().cloned()))
         .unwrap_or_default();
 
-    let setup = SessionSetup {
+    Ok(SessionSetup {
         modes: thinking_modes(&current_level),
         config_options: vec![model_config_option(
             &models,
             translate::current_model_value(&state),
         )],
-    };
-    Ok((pi, incoming, setup))
+    })
 }
 
 /// Spawn `pi --mode rpc` for a new ACP session and register it.
@@ -393,17 +400,41 @@ async fn start_session(state: &State, cwd: PathBuf) -> anyhow::Result<(SessionId
     Ok((session_id, setup))
 }
 
-/// Resume a persisted pi session, replay its history to the client, and register it.
+/// Resume a persisted pi session, replay its history to the client, and register
+/// it. Reuses an already-live session instead of spawning a second pi on the
+/// same session file.
 async fn load_session(
     state: &State,
     req: &LoadSessionRequest,
     conn: &ConnectionTo<Client>,
 ) -> anyhow::Result<SessionSetup> {
-    let (pi, incoming, setup) =
-        spawn_pi(&state.config, &req.cwd, req.session_id.0.as_ref()).await?;
+    let existing = state.sessions.lock().await.get(&req.session_id).cloned();
+    let (session, setup) = match existing {
+        Some(session) => {
+            let setup = session_setup(&session.pi).await?;
+            (session, setup)
+        }
+        None => {
+            let (pi, incoming, setup) =
+                spawn_pi(&state.config, &req.cwd, req.session_id.0.as_ref()).await?;
+            let session = Arc::new(Session {
+                pi: Arc::new(pi),
+                incoming: Mutex::new(incoming),
+                cwd: req.cwd.clone(),
+                aborted: AtomicBool::new(false),
+            });
+            state
+                .sessions
+                .lock()
+                .await
+                .insert(req.session_id.clone(), session.clone());
+            (session, setup)
+        }
+    };
 
-    let id = pi.next_id();
-    let messages = pi
+    let id = session.pi.next_id();
+    let messages = session
+        .pi
         .request(
             Command::GetMessages {
                 id: Some(id.clone()),
@@ -418,21 +449,12 @@ async fn load_session(
     for update in translate::history_updates(&messages, &req.cwd) {
         let _ = conn.send_notification(SessionNotification::new(req.session_id.clone(), update));
     }
-
-    state.sessions.lock().await.insert(
-        req.session_id.clone(),
-        Arc::new(Session {
-            pi: Arc::new(pi),
-            incoming: Mutex::new(incoming),
-            cwd: req.cwd.clone(),
-            aborted: AtomicBool::new(false),
-        }),
-    );
     Ok(setup)
 }
 
-/// Apply a `session/set_config_option` (currently: the model selector). Returns
-/// the refreshed config options reflecting the new selection.
+/// Apply a `session/set_config_option` (currently: the model selector). Awaits
+/// pi's confirmation so an invalid model / missing key surfaces as an error,
+/// then returns the refreshed config options.
 async fn set_config_option(
     state: &State,
     req: &SetSessionConfigOptionRequest,
@@ -454,30 +476,27 @@ async fn set_config_option(
         .get(&req.session_id)
         .cloned()
         .ok_or_else(|| anyhow::anyhow!("unknown session: {}", req.session_id.0))?;
-    session
-        .pi
-        .send(Command::SetModel {
-            id: None,
-            provider,
-            model_id,
-        })
-        .await?;
 
     let id = session.pi.next_id();
-    let models = session
+    let resp = session
         .pi
         .request(
-            Command::GetAvailableModels {
+            Command::SetModel {
                 id: Some(id.clone()),
+                provider,
+                model_id,
             },
             &id,
             PI_STATE_TIMEOUT,
         )
-        .await?
-        .data
-        .and_then(|d| d.get("models").and_then(|m| m.as_array().cloned()))
-        .unwrap_or_default();
-    Ok(vec![model_config_option(&models, Some(value))])
+        .await?;
+    if !resp.success {
+        anyhow::bail!(
+            "pi rejected model {value}: {}",
+            resp.error.unwrap_or_else(|| "no API key?".to_string())
+        );
+    }
+    Ok(session_setup(&session.pi).await?.config_options)
 }
 
 /// Build the model selector config option from pi's available models.
@@ -527,7 +546,7 @@ async fn run_prompt(
         .send(Command::Prompt {
             id: None,
             message: prompt_text(&req.prompt),
-            images: Vec::new(),
+            images: prompt_images(&req.prompt),
             streaming_behavior: None,
         })
         .await?;
@@ -780,6 +799,21 @@ fn prompt_text(blocks: &[ContentBlock]) -> String {
     out
 }
 
+/// Forward image content blocks of an ACP prompt to pi.
+fn prompt_images(blocks: &[ContentBlock]) -> Vec<Image> {
+    blocks
+        .iter()
+        .filter_map(|block| match block {
+            ContentBlock::Image(image) => Some(Image {
+                kind: ImageKind::Image,
+                data: image.data.clone(),
+                mime_type: image.mime_type.clone(),
+            }),
+            _ => None,
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -822,5 +856,19 @@ mod tests {
         let joined = c.take().expect("one chunk");
         assert_eq!(text_of(&joined), ("msg", "abcd".to_string()));
         assert!(c.take().is_none());
+    }
+
+    #[test]
+    fn extracts_prompt_images() {
+        use agent_client_protocol::schema::v1::ImageContent;
+        let blocks = vec![
+            ContentBlock::Text(agent_client_protocol::schema::v1::TextContent::new("hi")),
+            ContentBlock::Image(ImageContent::new("BASE64DATA", "image/png")),
+        ];
+        let images = prompt_images(&blocks);
+        assert_eq!(images.len(), 1);
+        assert_eq!(images[0].data, "BASE64DATA");
+        assert_eq!(images[0].mime_type, "image/png");
+        assert_eq!(prompt_text(&blocks), "hi");
     }
 }
