@@ -96,7 +96,7 @@ jobs:
           )
           for slug in "${!BIN[@]}"; do
             node npm/make-platform-package.mjs "$slug" "${BIN[$slug]}" "$VERSION"
-            (cd "npm/platform/$slug" && npm publish --access public)
+            (cd "npm/platform/$slug" && npm publish --access public) || echo "skip $slug (already published?)"
           done
       - name: Publish shim
         env:
@@ -104,4 +104,4 @@ jobs:
         run: |
           cd npm/pi-acpinator
           npm version "$VERSION" --no-git-tag-version --allow-same-version
-          npm publish --access public
+          npm publish --access public || echo "skip shim (already published?)"
