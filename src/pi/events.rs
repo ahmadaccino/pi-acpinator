@@ -241,4 +241,17 @@ mod tests {
         assert_eq!(ev.text_delta(), Some("hi"));
         assert_eq!(ev.thinking_delta(), None);
     }
+
+    #[test]
+    fn line_separators_inside_strings_survive() {
+        // U+2028/U+2029 are valid inside JSON strings; a byte-`\n` frame keeps
+        // them intact where a naive line reader would mis-split.
+        let line = "{\"type\":\"message_update\",\"assistantMessageEvent\":{\"type\":\"text_delta\",\"delta\":\"a\u{2028}b\u{2029}c\"}}";
+        assert!(!line.contains('\n'));
+        let ev = match parse_line(line) {
+            Some(Incoming::Event(e)) => e,
+            _ => panic!("expected event"),
+        };
+        assert_eq!(ev.text_delta(), Some("a\u{2028}b\u{2029}c"));
+    }
 }

@@ -16,3 +16,6 @@ jobs:
       - run: cargo fmt --check
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test
+      - run: cargo build
+      - name: Component test (scripted fake pi, no model)
+        run: node scripts/component-test.mjs

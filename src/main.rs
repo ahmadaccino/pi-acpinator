@@ -311,7 +311,8 @@ async fn spawn_pi(
         ));
     }
 
-    let (pi, incoming) = PiClient::spawn("pi", &args, cwd, &env).await?;
+    let program = std::env::var("PI_ACPINATOR_PI_BIN").unwrap_or_else(|_| "pi".to_string());
+    let (pi, incoming) = PiClient::spawn(&program, &args, cwd, &env).await?;
 
     let id = pi.next_id();
     let state = pi
@@ -799,6 +800,17 @@ mod tests {
         // remaining thought comes out on take
         let rest = c.take().expect("thought");
         assert_eq!(text_of(&rest), ("thought", "hmm".to_string()));
+        assert!(c.take().is_none());
+    }
+
+    #[test]
+    fn coalesces_a_pure_burst_into_one_chunk() {
+        let mut c = Coalescer::default();
+        for part in ["a", "b", "c", "d"] {
+            assert!(c.push(Stream::Message, part).is_none());
+        }
+        let joined = c.take().expect("one chunk");
+        assert_eq!(text_of(&joined), ("msg", "abcd".to_string()));
         assert!(c.take().is_none());
     }
 }
