@@ -22,6 +22,15 @@ const HISTORY = [
 ];
 
 async function runPrompt() {
+  const bench = parseInt(process.env.PI_FAKE_BENCH_DELTAS || "0", 10);
+  if (bench > 0) {
+    // high-throughput mode: emit `bench` tiny text deltas as fast as possible.
+    for (let n = 0; n < bench; n++) {
+      write({ type: "message_update", assistantMessageEvent: { type: "text_delta", delta: "tok " } });
+    }
+    write({ type: "agent_end", willRetry: false });
+    return;
+  }
   await sleep(5);
   // contiguous thinking burst
   write({ type: "message_update", assistantMessageEvent: { type: "thinking_delta", delta: "pon" } });

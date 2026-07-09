@@ -11,23 +11,26 @@ adapter is a small native binary — low memory, fast startup.
 
 Working today (live-verified against real pi):
 
-- `initialize` handshake
-- `session/new` — spawns and supervises a `pi --mode rpc` process per session; advertises
-  pi's thinking levels (`off`..`xhigh`) as ACP session modes
-- `session/prompt` — streams pi's assistant output and reasoning back as ACP
-  `agent_message_chunk` / `agent_thought_chunk`, coalescing delta bursts into fewer frames
+- `initialize` handshake; advertises `load_session` + a `pi` auth method
+- `session/new` — spawns and supervises a persistent `pi --mode rpc` session; advertises
+  pi's thinking levels (`off`..`xhigh`) as session modes and pi's models as a config option
+- `session/prompt` — streams assistant output + reasoning as `agent_message_chunk` /
+  `agent_thought_chunk`, coalescing delta bursts into far fewer frames
 - tool calls — pi tool execution maps to `tool_call` / `tool_call_update` (kind, status,
   output, cwd-resolved locations)
 - `session/request_permission` — a bundled pi extension gates tools via `ctx.ui.confirm`,
   surfaced to the client as ACP permission requests (scope: `off` | `mutating` | `all`)
 - `session/set_mode` — switches pi's thinking level
+- `session/set_config_option` — switches pi's model
+- `session/load` — resumes a persisted session and replays its history to the client
 - `session/cancel` — aborts the turn and resolves it with `StopReason::Cancelled`
 - fails a turn loudly if pi exits before completing it
 
-Measured: ~3 ms cold start, ~4 MiB idle bridge RSS, 1.9 MB stripped binary.
+Measured (deterministic bench, `node scripts/bench.mjs`): 1.95 MiB binary, ~2.3 ms cold start,
+~0.3 ms time-to-first-token, ~1.2M deltas/s with ~44x delta coalescing, ~5.5 MiB peak RSS.
 
-Deferred (see `plans/`): model selection via config options, `session/load` history replay,
-terminal auth advertisement, bounded-channel backpressure.
+Deferred (see `plans/`): full incoming-side backpressure (a naive bound risks a between-turn
+deadlock; outbound is bounded today).
 
 ## Install
 
@@ -62,8 +65,9 @@ your model provider / API key.
 ## Develop
 
 ```bash
-cargo test          # unit tests (framing, event classification, translation, coalescing)
-node scripts/bench.mjs   # cold-start + idle RSS
+cargo test                    # unit + transport tests (framing, translation, coalescing, correlation)
+node scripts/component-test.mjs   # end-to-end component test against a scripted fake pi (no model)
+node scripts/bench.mjs            # performance benchmarks (deterministic)
 RUST_LOG=debug cargo run
 ```
 

@@ -39,12 +39,16 @@ Collect `session/update` notifications + the id:3 result (`stopReason`).
 ## Milestones
 - `M1_5-tools-and-thinking.md` — [DONE] tool_call/tool_call_update mapping, thought streaming, locations.
 - `M2-permission-gate.md` — [DONE] bundled pi extension + `session/request_permission` (the differentiator).
-- `M3-config-and-sessions.md` — [PARTIAL] thinking-level modes + cancel→Cancelled done; model config_options, session/load replay, and terminal auth still deferred.
-- `M4-perf-and-benchmarks.md` — [DONE] delta coalescing, pi-exit supervision, release profile, benchmark harness. Bounded-channel backpressure still deferred.
+- `M3-config-and-sessions.md` — [DONE] thinking-level modes, model config option (+ set_config_option), session/load history replay, terminal auth, cancel→Cancelled.
+- `M4-perf-and-benchmarks.md` — [DONE] delta coalescing, pi-exit supervision, outbound backpressure, release profile, benchmark harness. Full incoming backpressure still deferred (between-turn deadlock hazard).
 - `M5-distribution.md` — [DONE] npm shim + platform packages, cross-build release workflow, CI, cargo metadata.
-- `TESTING.md` — unit tests landed (framing, translation, coalescing) + live smokes; component harness (fake pi + `Channel::duplex`) still to build.
+- `TESTING.md` — [DONE] unit + transport tests (fake pi via duplex) + deterministic component harness (fake pi drives the real binary over ACP, 12 checks) + live smokes.
 
-## Verified end-to-end (against real pi)
-initialize · session/new (modes) · session/prompt (text+thought+tool streaming, coalesced) ·
-session/request_permission (allow/reject) · session/set_mode · session/cancel (Cancelled) ·
-npm shim launcher. Bench: ~3 ms cold start, ~4 MiB idle RSS, 1.9 MB binary.
+## Verified end-to-end
+Against real pi and against a scripted fake pi (component test, no model):
+initialize (caps+auth) · session/new (6 modes + 159-model config) · authenticate · prompt
+(coalesced text+thought+tool streaming) · request_permission (allow/reject) · set_mode ·
+set_config_option · session/load (history replay) · cancel (Cancelled).
+
+Bench (deterministic): 1.95 MiB binary · ~2.3 ms cold start · ~0.3 ms TTFT · ~1.2M deltas/s ·
+~44x delta coalescing · ~5.5 MiB peak RSS.
