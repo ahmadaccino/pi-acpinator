@@ -1,0 +1,15 @@
+exclude = [
+    "**/.git/**",
+    "**/.svn/**",
+    "**/.hg/**",
+    "**/target/**",
+    "**/node_modules/**",
+    "**/dist/**",
+    "**/build/**",
+    "Cargo.lock",
+]
+max_size = 10485760
+max_depth = 20
+output = "both"
+hidden = false
+no_ignore = false

@@ -2,12 +2,14 @@
 name = "pi-acpinator"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.85"
 description = "A fast, tiny ACP (Agent Client Protocol) adapter for the pi coding agent."
 license = "MIT"
 repository = "https://github.com/ahmadaccino/pi-acpinator"
 readme = "README.md"
 keywords = ["acp", "agent-client-protocol", "pi", "llm", "agent"]
 categories = ["command-line-utilities", "development-tools"]
+exclude = ["npm/", "scripts/", ".github/"]
 
 [dependencies]
 agent-client-protocol = "1.2.0"
