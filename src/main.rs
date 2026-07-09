@@ -4,24 +4,70 @@ mod acp;
 mod pi;
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
 use agent_client_protocol::schema::v1::{
     AgentCapabilities, CancelNotification, ContentBlock, ContentChunk, InitializeRequest,
-    InitializeResponse, NewSessionRequest, NewSessionResponse, PromptRequest, PromptResponse,
-    SessionId, SessionNotification, SessionUpdate, StopReason, ToolCall, ToolCallId,
-    ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields,
+    InitializeResponse, NewSessionRequest, NewSessionResponse, PermissionOption,
+    PermissionOptionId, PermissionOptionKind, PromptRequest, PromptResponse,
+    RequestPermissionOutcome, RequestPermissionRequest, SessionId, SessionNotification,
+    SessionUpdate, StopReason, ToolCall, ToolCallId, ToolCallStatus, ToolCallUpdate,
+    ToolCallUpdateFields,
 };
-use agent_client_protocol::{Agent, Client, ConnectionTo, Dispatch, Result, Stdio};
+use agent_client_protocol::{Agent, Client, ConnectionTo, Dispatch, Stdio};
 use tokio::sync::Mutex;
 
 use crate::acp::translate;
 use crate::pi::client::{PiClient, PiIncoming};
-use crate::pi::events::{Command, Event, Incoming};
+use crate::pi::events::{Command, Event, ExtensionUiRequest, ExtensionUiResponse, Incoming};
 
 const PI_STATE_TIMEOUT: Duration = Duration::from_secs(5);
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ApprovalMode {
+    Off,
+    Mutating,
+    All,
+}
+
+impl ApprovalMode {
+    fn from_env() -> Self {
+        match std::env::var("PI_ACPINATOR_APPROVAL")
+            .unwrap_or_default()
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "off" => Self::Off,
+            "all" => Self::All,
+            _ => Self::Mutating,
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Mutating => "mutating",
+            Self::All => "all",
+        }
+    }
+}
+
+#[derive(Clone)]
+struct Config {
+    approval: ApprovalMode,
+    gate_path: Option<Arc<str>>,
+}
+
+/// Owns the temp file for the bundled gate extension; removes it on shutdown.
+struct GateFile(PathBuf);
+
+impl Drop for GateFile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
 
 struct Session {
     pi: Arc<PiClient>,
@@ -29,13 +75,14 @@ struct Session {
     cwd: PathBuf,
 }
 
-#[derive(Default, Clone)]
+#[derive(Clone)]
 struct State {
     sessions: Arc<Mutex<HashMap<SessionId, Arc<Session>>>>,
+    config: Config,
 }
 
 #[tokio::main(flavor = "current_thread")]
-async fn main() -> Result<()> {
+async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
         .with_env_filter(
@@ -44,7 +91,25 @@ async fn main() -> Result<()> {
         )
         .init();
 
-    let state = State::default();
+    let approval = ApprovalMode::from_env();
+    let gate = if approval == ApprovalMode::Off {
+        None
+    } else {
+        let path = std::env::temp_dir().join(format!("pi-acpinator-gate-{}.ts", uuid::Uuid::new_v4()));
+        std::fs::write(&path, include_str!("../assets/permission-gate.ts"))?;
+        Some(GateFile(path))
+    };
+    let config = Config {
+        approval,
+        gate_path: gate
+            .as_ref()
+            .map(|g| Arc::from(g.0.to_string_lossy().as_ref())),
+    };
+
+    let state = State {
+        sessions: Arc::new(Mutex::new(HashMap::new())),
+        config,
+    };
 
     Agent
         .builder()
@@ -76,12 +141,26 @@ async fn main() -> Result<()> {
             {
                 let state = state.clone();
                 async move |req: PromptRequest, responder, conn: ConnectionTo<Client>| {
-                    match run_prompt(&state, req, conn).await {
-                        Ok(stop) => responder.respond(PromptResponse::new(stop)),
-                        Err(err) => responder.respond_with_error(
-                            agent_client_protocol::util::internal_error(err.to_string()),
-                        ),
-                    }
+                    let session = state.sessions.lock().await.get(&req.session_id).cloned();
+                    let Some(session) = session else {
+                        return responder.respond_with_error(
+                            agent_client_protocol::util::internal_error(format!(
+                                "unknown session: {}",
+                                req.session_id.0
+                            )),
+                        );
+                    };
+                    let task_conn = conn.clone();
+                    conn.spawn(async move {
+                        let stop = run_prompt(session, req, task_conn).await;
+                        let _ = match stop {
+                            Ok(reason) => responder.respond(PromptResponse::new(reason)),
+                            Err(err) => responder.respond_with_error(
+                                agent_client_protocol::util::internal_error(err.to_string()),
+                            ),
+                        };
+                        Ok(())
+                    })
                 }
             },
             agent_client_protocol::on_receive_request!(),
@@ -99,30 +178,58 @@ async fn main() -> Result<()> {
             agent_client_protocol::on_receive_notification!(),
         )
         .on_receive_dispatch(
-            async move |message: Dispatch, cx: ConnectionTo<Client>| {
-                message.respond_with_error(
+            async move |message: Dispatch, cx: ConnectionTo<Client>| match message {
+                Dispatch::Response(result, router) => router.respond_with_result(result),
+                other => other.respond_with_error(
                     agent_client_protocol::util::internal_error("unhandled message"),
                     cx,
-                )
+                ),
             },
             agent_client_protocol::on_receive_dispatch!(),
         )
         .connect_to(Stdio::new())
         .await
+        .map_err(|err| anyhow::anyhow!("{err}"))?;
+
+    drop(gate);
+    Ok(())
 }
 
 /// Spawn `pi --mode rpc` for a new ACP session and register it.
 async fn start_session(state: &State, cwd: PathBuf) -> anyhow::Result<SessionId> {
-    let args = [
+    let mut args = vec![
         "--mode".to_string(),
         "rpc".to_string(),
         "--no-session".to_string(),
     ];
-    let (pi, incoming) = PiClient::spawn("pi", &args, &cwd, &[]).await?;
-    // Confirm the process is live and responsive before advertising the session.
+    let mut env = Vec::new();
+    if let Some(gate_path) = &state.config.gate_path {
+        args.push("--extension".to_string());
+        args.push(gate_path.to_string());
+        env.push((
+            "PI_ACP_APPROVAL_MODE".to_string(),
+            state.config.approval.as_str().to_string(),
+        ));
+    }
+
+    let (pi, incoming) = PiClient::spawn("pi", &args, &cwd, &env).await?;
     let id = pi.next_id();
     pi.request(Command::GetState { id: Some(id.clone()) }, &id, PI_STATE_TIMEOUT)
         .await?;
+
+    if state.config.gate_path.is_some() {
+        let id = pi.next_id();
+        let resp = pi
+            .request(Command::GetCommands { id: Some(id.clone()) }, &id, PI_STATE_TIMEOUT)
+            .await?;
+        let loaded = resp
+            .data
+            .map(|d| d.to_string().contains("acp-permission-gate"))
+            .unwrap_or(false);
+        if !loaded {
+            anyhow::bail!("permission gate extension failed to load");
+        }
+    }
 
     let session_id = SessionId::new(uuid::Uuid::new_v4().to_string());
     state.sessions.lock().await.insert(
@@ -137,45 +244,105 @@ async fn start_session(state: &State, cwd: PathBuf) -> anyhow::Result<SessionId>
 }
 
 /// Forward a prompt to pi and stream its output back as ACP session updates,
-/// resolving when pi's turn ends.
+/// bridging permission requests, until pi's turn ends.
 async fn run_prompt(
-    state: &State,
+    session: Arc<Session>,
     req: PromptRequest,
     conn: ConnectionTo<Client>,
 ) -> anyhow::Result<StopReason> {
-    let session = state
-        .sessions
-        .lock()
-        .await
-        .get(&req.session_id)
-        .cloned()
-        .ok_or_else(|| anyhow::anyhow!("unknown session: {}", req.session_id.0))?;
-
-    let message = prompt_text(&req.prompt);
+    let session_id = req.session_id.clone();
     session.pi.send(Command::Prompt {
         id: None,
-        message,
+        message: prompt_text(&req.prompt),
         images: Vec::new(),
         streaming_behavior: None,
     })?;
 
     let mut incoming = session.incoming.lock().await;
     while let Some(item) = incoming.recv().await {
-        let Incoming::Event(event) = item else {
-            continue;
-        };
-        for update in translate_event(&event, &session.cwd) {
-            let _ = conn.send_notification(SessionNotification::new(req.session_id.clone(), update));
-        }
-        if event.kind == "agent_end" && !event.will_retry.unwrap_or(false) {
-            return Ok(StopReason::EndTurn);
+        match item {
+            Incoming::Event(event) => {
+                for update in translate_event(&event, &session.cwd) {
+                    let _ = conn
+                        .send_notification(SessionNotification::new(session_id.clone(), update));
+                }
+                if event.kind == "agent_end" && !event.will_retry.unwrap_or(false) {
+                    return Ok(StopReason::EndTurn);
+                }
+            }
+            Incoming::ExtensionUiRequest(ui) => {
+                let response = handle_ui_request(&conn, &session_id, &ui).await;
+                let _ = session.pi.respond_ui(response);
+            }
+            _ => {}
         }
     }
     Ok(StopReason::EndTurn)
 }
 
+/// Translate a pi extension-UI request into an ACP permission decision (or
+/// cancel unsupported dialogs so pi never hangs waiting on us).
+async fn handle_ui_request(
+    conn: &ConnectionTo<Client>,
+    session_id: &SessionId,
+    ui: &ExtensionUiRequest,
+) -> ExtensionUiResponse {
+    if ui.method != "confirm" {
+        return ExtensionUiResponse {
+            id: ui.id.clone(),
+            confirmed: None,
+            value: None,
+            cancelled: Some(true),
+        };
+    }
+    ExtensionUiResponse {
+        id: ui.id.clone(),
+        confirmed: Some(request_permission(conn, session_id, ui).await),
+        value: None,
+        cancelled: None,
+    }
+}
+
+/// Ask the ACP client to approve a tool via `session/request_permission`.
+async fn request_permission(
+    conn: &ConnectionTo<Client>,
+    session_id: &SessionId,
+    ui: &ExtensionUiRequest,
+) -> bool {
+    let title = ui
+        .title
+        .clone()
+        .or_else(|| ui.message.clone())
+        .unwrap_or_else(|| "Allow tool?".to_string());
+    let tool_call =
+        ToolCallUpdate::new(ToolCallId::new(ui.id.as_str()), ToolCallUpdateFields::new().title(title));
+    let options = vec![
+        PermissionOption::new(
+            PermissionOptionId::new("allow"),
+            "Allow",
+            PermissionOptionKind::AllowOnce,
+        ),
+        PermissionOption::new(
+            PermissionOptionId::new("reject"),
+            "Reject",
+            PermissionOptionKind::RejectOnce,
+        ),
+    ];
+    let request = RequestPermissionRequest::new(session_id.clone(), tool_call, options);
+    match conn.send_request(request).block_task().await {
+        Ok(response) => matches!(
+            response.outcome,
+            RequestPermissionOutcome::Selected(sel) if sel.option_id.0.starts_with("allow")
+        ),
+        Err(err) => {
+            tracing::debug!(%err, "permission request failed");
+            false
+        }
+    }
+}
+
 /// Translate a single pi event into zero or more ACP session updates.
-fn translate_event(event: &Event, cwd: &std::path::Path) -> Vec<SessionUpdate> {
+fn translate_event(event: &Event, cwd: &Path) -> Vec<SessionUpdate> {
     if let Some(delta) = event.text_delta() {
         return vec![SessionUpdate::AgentMessageChunk(ContentChunk::new(
             translate::text_block(delta),
