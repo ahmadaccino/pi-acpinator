@@ -37,9 +37,14 @@ Send LF-delimited JSON-RPC 2.0:
 Collect `session/update` notifications + the id:3 result (`stopReason`).
 
 ## Milestones
-- `M1_5-tools-and-thinking.md` — tool_call/tool_call_update mapping, thought streaming, diffs, locations.
-- `M2-permission-gate.md` — bundled pi extension + `session/request_permission` (the differentiator).
-- `M3-config-and-sessions.md` — model/thinking configOptions, session/load & resume, auth, cancel correctness.
-- `M4-perf-and-benchmarks.md` — delta coalescing, backpressure, supervision, benchmark harness.
-- `M5-distribution.md` — prebuilt binaries, cargo, npm shim, CI release.
-- `TESTING.md` — component tests (fake pi + in-memory ACP `Channel::duplex`), conformance.
+- `M1_5-tools-and-thinking.md` — [DONE] tool_call/tool_call_update mapping, thought streaming, locations.
+- `M2-permission-gate.md` — [DONE] bundled pi extension + `session/request_permission` (the differentiator).
+- `M3-config-and-sessions.md` — [PARTIAL] thinking-level modes + cancel→Cancelled done; model config_options, session/load replay, and terminal auth still deferred.
+- `M4-perf-and-benchmarks.md` — [DONE] delta coalescing, pi-exit supervision, release profile, benchmark harness. Bounded-channel backpressure still deferred.
+- `M5-distribution.md` — [DONE] npm shim + platform packages, cross-build release workflow, CI, cargo metadata.
+- `TESTING.md` — unit tests landed (framing, translation, coalescing) + live smokes; component harness (fake pi + `Channel::duplex`) still to build.
+
+## Verified end-to-end (against real pi)
+initialize · session/new (modes) · session/prompt (text+thought+tool streaming, coalesced) ·
+session/request_permission (allow/reject) · session/set_mode · session/cancel (Cancelled) ·
+npm shim launcher. Bench: ~3 ms cold start, ~4 MiB idle RSS, 1.9 MB binary.
