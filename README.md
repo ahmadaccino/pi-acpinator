@@ -13,21 +13,22 @@ Every other pi ACP adapter is a Node.js process. `pi-acpinator` is a single nati
 so the adapter layer costs almost nothing. Measured head-to-head at the ACP `initialize` stage
 (`node scripts/bench-compare.mjs`, Apple M-series, medians):
 
-| Adapter | Architecture | Cold start | Idle RSS |
+| Adapter | Architecture | Cold start | Resident memory |
 |---|---|---|---|
 | **pi-acpinator** | **Rust native binary, spawns `pi`** | **~4 ms** | **~3 MiB** |
 | [`pi-acp`](https://github.com/svkozak/pi-acp) (svkozak, 472★) | Node, spawns `pi` | ~100 ms | ~76 MiB |
-| [`@victor-software-house/pi-acp`](https://github.com/victor-software-house/pi-acp) | Node, **embeds the pi SDK in-process** + background daemon | heavier still¹ | heavier still¹ |
+| [`@victor-software-house/pi-acp`](https://github.com/victor-software-house/pi-acp) | Bun, **embeds the pi SDK** in a persistent daemon | ~22 ms¹ | **~194 MiB**¹ |
 
-That's roughly **20× faster startup and ~24× less memory** than the most popular adapter —
-before `pi` itself is even launched. The reasons it wins across the board:
+That's roughly **20× faster startup and ~24× less memory** than the most popular adapter, and
+**~60× less memory** than the daemon-based one — all before `pi` itself is even launched. The
+reasons it wins across the board:
 
-- **No runtime tax.** No Node/V8/Bun to boot or resident — the Node adapters carry ~76 MiB and
-  ~100 ms of runtime overhead *per adapter process*, before doing any work. pi-acpinator is
-  ~3 MiB and starts in single-digit milliseconds.
+- **No runtime tax.** No Node/V8/Bun to boot or keep resident — the Node adapter carries ~76 MiB
+  and ~100 ms of runtime overhead *per process*, and the Bun daemon sits at ~194 MiB resident,
+  before either does any work. pi-acpinator is ~3 MiB and starts in single-digit milliseconds.
 - **Process isolation, not embedding.** Like svkozak's, it spawns `pi` as a child (clean
-  lifecycle, `kill_on_drop`). The `victor`/`harms-haus` adapters embed the entire pi Node SDK
-  *inside* the adapter, duplicating the runtime; `victor` additionally needs a separate daemon.
+  lifecycle, `kill_on_drop`). The `victor`/`harms-haus` adapters embed the entire pi SDK
+  *inside* the adapter; `victor` runs it in a persistent background daemon (the ~194 MiB above).
 - **Lower streaming overhead.** Delta bursts are coalesced (~45× fewer ACP frames in the
   benchmark), both pipes are bounded for backpressure, and a dropped `pi` fails the turn loudly
   instead of hanging.
@@ -35,12 +36,14 @@ before `pi` itself is even launched. The reasons it wins across the board:
   permission gate) and a separate `agent_thought_chunk` reasoning stream — both of which the
   Node adapters document as *not* implemented — plus tool diffs, thinking modes, model
   selection, and `session/load` history replay.
-- **Trivial to ship and run.** One ~2 MB static binary (musl included): `npx pi-acpinator`,
-  `cargo install pi-acpinator`, or a prebuilt release binary.
+- **Trivial to ship and run.** One ~2 MB static binary (musl included), no runtime dependency:
+  `npx pi-acpinator`, `cargo install pi-acpinator`, or a prebuilt release binary.
 
-¹ `@victor-software-house/pi-acp` embeds the full pi Node SDK and requires a background daemon,
-so its resident footprint is strictly larger than a spawn-based Node adapter; it does not run
-standalone, so it's described architecturally rather than benchmarked here.
+¹ `@victor-software-house/pi-acp` requires the Bun runtime and a persistent background daemon
+that embeds the full pi SDK. The ~194 MiB is that daemon at idle (no session); the ~22 ms cold
+start is the thin client connecting to an *already-warm* daemon — the first invocation also pays
+the daemon spawn. Measured with `node scripts/bench-compare.mjs` (svkozak) and its documented
+Bun/daemon procedure (victor).
 
 ## Status
 

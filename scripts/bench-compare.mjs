@@ -66,4 +66,34 @@ for (const t of targets) {
   if (!starts.length) { console.log(`${t.name}: did not respond to initialize`); continue; }
   console.log(`${t.name}\n  cold start: ${median(starts).toFixed(1)} ms   RSS: ${(median(mems) / 1024 / 1024).toFixed(1)} MiB`);
 }
+
+// @victor-software-house/pi-acp: Bun runtime + persistent daemon that embeds the
+// pi SDK. Measured separately: idle daemon RSS + thin-client cold start (warm daemon).
+let bun = null;
+try { bun = execSync("command -v bun").toString().trim(); } catch {}
+if (bun) {
+  try {
+    console.error("installing @victor-software-house/pi-acp\u2026");
+    execSync("npm i @victor-software-house/pi-acp@latest", { cwd: work, stdio: "ignore" });
+    const entry = join(work, "node_modules/@victor-software-house/pi-acp/dist/index.mjs");
+    execSync("pkill -f 'index.mjs --daemon' || true", { stdio: "ignore" });
+    const daemon = spawn(bun, [entry, "--daemon"], { cwd: work, stdio: "ignore", detached: true });
+    await new Promise((r) => setTimeout(r, 8000));
+    const dpid = Number(execSync("pgrep -f 'index.mjs --daemon' | head -1").toString().trim());
+    const idle = rssTreeBytes(dpid);
+    const cs = [];
+    for (let i = 0; i < 5; i++) {
+      const r = await once(bun, [entry]);
+      if (r) cs.push(r.ms);
+      await new Promise((r) => setTimeout(r, 250));
+    }
+    execSync("pkill -f 'index.mjs --daemon' || true", { stdio: "ignore" });
+    try { daemon.kill("SIGKILL"); } catch {}
+    console.log(`@victor-software-house/pi-acp (Bun daemon, embeds SDK)\n  cold start (warm daemon): ${cs.length ? median(cs).toFixed(1) : "n/a"} ms   daemon RSS (idle): ${(idle / 1024 / 1024).toFixed(1)} MiB`);
+  } catch (e) {
+    console.log(`@victor-software-house/pi-acp: measurement failed (${e.message})`);
+  }
+} else {
+  console.log("@victor-software-house/pi-acp: skipped (needs the Bun runtime)");
+}
 process.exit(0);
