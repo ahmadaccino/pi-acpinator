@@ -11,6 +11,20 @@ const here = dirname(fileURLToPath(import.meta.url));
 const BIN =
 	process.argv[2] || join(here, "..", "target", "debug", "pi-acpinator");
 const FAKE = join(here, "fake-pi.mjs");
+const MCP_SERVERS = [
+	{
+		name: "stdio-tools",
+		command: "/bin/echo",
+		args: ["mcp"],
+		env: [{ name: "TOKEN", value: "secret" }],
+	},
+	{
+		type: "http",
+		name: "http-tools",
+		url: "http://127.0.0.1:65535/mcp",
+		headers: [{ name: "Authorization", value: "Bearer test" }],
+	},
+];
 
 const child = spawn(BIN, [], {
 	stdio: ["pipe", "pipe", "inherit"],
@@ -20,6 +34,7 @@ const child = spawn(BIN, [], {
 		PI_ACPINATOR_APPROVAL: "off",
 		PI_ACPINATOR_PI_BIN: FAKE,
 		PI_ACPINATOR_PERMISSION_TIMEOUT_MS: "30",
+		PI_FAKE_EXPECT_MCP_CONFIG: "1",
 	},
 });
 
@@ -109,6 +124,11 @@ child.stdout.on("data", (d) => {
 				m.result.agentCapabilities?.loadSession === true,
 			);
 			check(
+				"initialize advertises MCP HTTP/SSE passthrough",
+				m.result.agentCapabilities?.mcpCapabilities?.http === true &&
+					m.result.agentCapabilities?.mcpCapabilities?.sse === true,
+			);
+			check(
 				"initialize advertises no auth (pi keys are external)",
 				(m.result.authMethods || []).length === 0,
 			);
@@ -116,10 +136,15 @@ child.stdout.on("data", (d) => {
 				jsonrpc: "2.0",
 				id: 2,
 				method: "session/new",
-				params: { cwd: "/tmp", mcpServers: [], additionalDirectories: [] },
+				params: {
+					cwd: "/tmp",
+					mcpServers: MCP_SERVERS,
+					additionalDirectories: [],
+				},
 			});
 		} else if (m.id === 2 && m.result) {
 			sid = m.result.sessionId;
+			check("session/new forwards MCP config", true);
 			check(
 				"session/new returns 6 thinking modes",
 				m.result.modes?.availableModes?.length === 6,
@@ -188,7 +213,7 @@ child.stdout.on("data", (d) => {
 				jsonrpc: "2.0",
 				id: 8,
 				method: "session/load",
-				params: { sessionId: sid, cwd: "/tmp", mcpServers: [] },
+				params: { sessionId: sid, cwd: "/tmp", mcpServers: MCP_SERVERS },
 			});
 		} else if (m.id === 8 && m.result) {
 			check(
@@ -233,7 +258,7 @@ child.stdout.on("data", (d) => {
 				jsonrpc: "2.0",
 				id: 13,
 				method: "session/load",
-				params: { sessionId: sid, cwd: "/tmp", mcpServers: [] },
+				params: { sessionId: sid, cwd: "/tmp", mcpServers: MCP_SERVERS },
 			});
 		} else if (m.id === 13 && m.result) {
 			check(

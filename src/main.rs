@@ -9,9 +9,11 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
+#[cfg(feature = "mcp-passthrough")]
+use agent_client_protocol::schema::v1::McpCapabilities;
 use agent_client_protocol::schema::v1::{
     AgentCapabilities, CancelNotification, ContentBlock, ContentChunk, InitializeRequest,
-    InitializeResponse, LoadSessionRequest, LoadSessionResponse, NewSessionRequest,
+    InitializeResponse, LoadSessionRequest, LoadSessionResponse, McpServer, NewSessionRequest,
     NewSessionResponse, PermissionOption, PermissionOptionId, PermissionOptionKind, PromptRequest,
     PromptResponse, RequestPermissionOutcome, RequestPermissionRequest, SessionConfigOption,
     SessionId, SessionMode, SessionModeId, SessionModeState, SessionNotification, SessionUpdate,
@@ -85,6 +87,10 @@ struct Session {
     turn_lock: Mutex<()>,
     cwd: PathBuf,
     aborted: AtomicBool,
+    #[cfg(feature = "mcp-passthrough")]
+    _mcp_config: Option<crate::acp::mcp::ConfigFile>,
+    #[cfg(feature = "mcp-passthrough")]
+    mcp_key: Option<u64>,
 }
 
 #[derive(Clone)]
@@ -150,7 +156,7 @@ async fn main() -> anyhow::Result<()> {
             async move |req: InitializeRequest, responder, _conn| {
                 responder.respond(
                     InitializeResponse::new(req.protocol_version)
-                        .agent_capabilities(AgentCapabilities::new().load_session(true)),
+                        .agent_capabilities(agent_capabilities()),
                 )
             },
             agent_client_protocol::on_receive_request!(),
@@ -159,7 +165,7 @@ async fn main() -> anyhow::Result<()> {
             {
                 let state = state.clone();
                 async move |req: NewSessionRequest, responder, _conn: ConnectionTo<Client>| {
-                    match start_session(&state, req.cwd).await {
+                    match start_session(&state, req.cwd, req.mcp_servers).await {
                         Ok((session_id, setup)) => responder.respond(
                             NewSessionResponse::new(session_id)
                                 .modes(Some(setup.modes))
@@ -300,19 +306,47 @@ struct SessionSetup {
     config_options: Vec<SessionConfigOption>,
 }
 
+fn agent_capabilities() -> AgentCapabilities {
+    let capabilities = AgentCapabilities::new().load_session(true);
+    #[cfg(feature = "mcp-passthrough")]
+    let capabilities = capabilities.mcp_capabilities(McpCapabilities::new().http(true).sse(true));
+    capabilities
+}
+
+struct SpawnedPi {
+    pi: PiClient,
+    incoming: PiIncoming,
+    setup: SessionSetup,
+    #[cfg(feature = "mcp-passthrough")]
+    mcp_config: Option<crate::acp::mcp::ConfigFile>,
+    #[cfg(feature = "mcp-passthrough")]
+    mcp_key: Option<u64>,
+}
+
 /// Spawn `pi --mode rpc` bound to `session_id`, run the handshake, and build the
 /// modes + config options. Shared by session/new and session/load.
 async fn spawn_pi(
     config: &Config,
     cwd: &Path,
     session_id: &str,
-) -> anyhow::Result<(PiClient, PiIncoming, SessionSetup)> {
+    mcp_servers: &[McpServer],
+) -> anyhow::Result<SpawnedPi> {
+    #[cfg(feature = "mcp-passthrough")]
+    let mcp_config = crate::acp::mcp::prepare(mcp_servers)?;
+    #[cfg(not(feature = "mcp-passthrough"))]
+    reject_mcp_servers(mcp_servers)?;
+
     let mut args = vec![
         "--mode".to_string(),
         "rpc".to_string(),
         "--session-id".to_string(),
         session_id.to_string(),
     ];
+    #[cfg(feature = "mcp-passthrough")]
+    if let Some(path) = mcp_config.path() {
+        args.push("--mcp-config".to_string());
+        args.push(path.to_string_lossy().into_owned());
+    }
     let mut env = Vec::new();
     if let Some(gate_path) = &config.gate_path {
         args.push("--extension".to_string());
@@ -346,7 +380,26 @@ async fn spawn_pi(
     }
 
     let setup = session_setup(&pi).await?;
-    Ok((pi, incoming, setup))
+    #[cfg(feature = "mcp-passthrough")]
+    let (mcp_config, mcp_key) = mcp_config.into_parts();
+    Ok(SpawnedPi {
+        pi,
+        incoming,
+        setup,
+        #[cfg(feature = "mcp-passthrough")]
+        mcp_config,
+        #[cfg(feature = "mcp-passthrough")]
+        mcp_key,
+    })
+}
+
+#[cfg(not(feature = "mcp-passthrough"))]
+fn reject_mcp_servers(mcp_servers: &[McpServer]) -> anyhow::Result<()> {
+    if mcp_servers.is_empty() {
+        Ok(())
+    } else {
+        anyhow::bail!("this pi-acpinator binary was built without MCP passthrough")
+    }
 }
 
 /// Read pi's current thinking level + models and build the advertised modes and
@@ -394,42 +447,59 @@ async fn session_setup(pi: &PiClient) -> anyhow::Result<SessionSetup> {
 }
 
 /// Spawn `pi --mode rpc` for a new ACP session and register it.
-async fn start_session(state: &State, cwd: PathBuf) -> anyhow::Result<(SessionId, SessionSetup)> {
+async fn start_session(
+    state: &State,
+    cwd: PathBuf,
+    mcp_servers: Vec<McpServer>,
+) -> anyhow::Result<(SessionId, SessionSetup)> {
     let session_id = uuid::Uuid::new_v4().to_string();
-    let (pi, incoming, setup) = spawn_pi(&state.config, &cwd, &session_id).await?;
+    let spawned = spawn_pi(&state.config, &cwd, &session_id, &mcp_servers).await?;
     let session_id = SessionId::new(session_id);
     state
         .insert_session(
             session_id.clone(),
             Arc::new(Session {
-                pi: Arc::new(pi),
-                incoming: Mutex::new(incoming),
+                pi: Arc::new(spawned.pi),
+                incoming: Mutex::new(spawned.incoming),
                 turn_lock: Mutex::new(()),
                 cwd: cwd.clone(),
                 aborted: AtomicBool::new(false),
+                #[cfg(feature = "mcp-passthrough")]
+                _mcp_config: spawned.mcp_config,
+                #[cfg(feature = "mcp-passthrough")]
+                mcp_key: spawned.mcp_key,
             }),
         )
         .await;
-    Ok((session_id, setup))
+    Ok((session_id, spawned.setup))
 }
 
 async fn spawn_loaded_session(
     state: &State,
     req: &LoadSessionRequest,
 ) -> anyhow::Result<(Arc<Session>, SessionSetup)> {
-    let (pi, incoming, setup) =
-        spawn_pi(&state.config, &req.cwd, req.session_id.0.as_ref()).await?;
+    let spawned = spawn_pi(
+        &state.config,
+        &req.cwd,
+        req.session_id.0.as_ref(),
+        &req.mcp_servers,
+    )
+    .await?;
     let session = Arc::new(Session {
-        pi: Arc::new(pi),
-        incoming: Mutex::new(incoming),
+        pi: Arc::new(spawned.pi),
+        incoming: Mutex::new(spawned.incoming),
         turn_lock: Mutex::new(()),
         cwd: req.cwd.clone(),
         aborted: AtomicBool::new(false),
+        #[cfg(feature = "mcp-passthrough")]
+        _mcp_config: spawned.mcp_config,
+        #[cfg(feature = "mcp-passthrough")]
+        mcp_key: spawned.mcp_key,
     });
     state
         .insert_session(req.session_id.clone(), session.clone())
         .await;
-    Ok((session, setup))
+    Ok((session, spawned.setup))
 }
 
 /// Resume a persisted pi session, replay its history to the client, and register
@@ -440,7 +510,22 @@ async fn load_session(
     req: &LoadSessionRequest,
     conn: &ConnectionTo<Client>,
 ) -> anyhow::Result<SessionSetup> {
+    #[cfg(feature = "mcp-passthrough")]
+    let requested_mcp_key = crate::acp::mcp::config_key(&req.mcp_servers)?;
+    #[cfg(not(feature = "mcp-passthrough"))]
+    reject_mcp_servers(&req.mcp_servers)?;
+
     let existing = state.session(&req.session_id).await;
+    #[cfg(feature = "mcp-passthrough")]
+    let existing = match existing {
+        Some(session) if session.mcp_key.as_ref() != requested_mcp_key.as_ref() => {
+            state
+                .remove_session_if_same(&req.session_id, &session)
+                .await;
+            None
+        }
+        other => other,
+    };
     let (session, setup) = match existing {
         Some(session) => match session_setup(&session.pi).await {
             Ok(setup) => (session, setup),
@@ -960,6 +1045,10 @@ mod tests {
             turn_lock: Mutex::new(()),
             cwd: PathBuf::from("/tmp"),
             aborted: AtomicBool::new(false),
+            #[cfg(feature = "mcp-passthrough")]
+            _mcp_config: None,
+            #[cfg(feature = "mcp-passthrough")]
+            mcp_key: None,
         })
     }
 

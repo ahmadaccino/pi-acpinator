@@ -11,6 +11,10 @@ keywords = ["acp", "coding-agent", "pi", "llm", "agent"]
 categories = ["command-line-utilities", "development-tools"]
 exclude = ["npm/", "scripts/", ".github/"]
 
+[features]
+default = ["mcp-passthrough"]
+mcp-passthrough = []
+
 [dependencies]
 agent-client-protocol = "1.2.0"
 anyhow = "1.0.103"
@@ -18,7 +22,16 @@ bytes = "1.12.1"
 futures = "0.3.32"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"
-tokio = { version = "1.52.3", features = ["rt", "macros", "process", "io-util", "io-std", "sync", "time", "signal"] }
+tokio = { version = "1.52.3", features = [
+  "rt",
+  "macros",
+  "process",
+  "io-util",
+  "io-std",
+  "sync",
+  "time",
+  "signal",
+] }
 tokio-util = { version = "0.7.18", features = ["codec"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }

@@ -2,6 +2,8 @@
 
 // A scripted fake `pi --mode rpc` for deterministic component tests: no model,
 // no network. Reads JSONL commands on stdin, emits canned responses/events.
+import { readFileSync } from "node:fs";
+
 let buf = "";
 const write = (o) => process.stdout.write(JSON.stringify(o) + "\n");
 const reply = (cmd, id, data) =>
@@ -9,6 +11,35 @@ const reply = (cmd, id, data) =>
 const replyError = (cmd, id, error) =>
 	write({ type: "response", command: cmd, success: false, id, error });
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const argValue = (flag) => {
+	const index = process.argv.indexOf(flag);
+	return index >= 0 ? process.argv[index + 1] : undefined;
+};
+const failStartup = (message) => {
+	console.error(message);
+	process.exit(2);
+};
+const mcpConfigPath = argValue("--mcp-config");
+let mcpConfig = null;
+if (mcpConfigPath) {
+	try {
+		mcpConfig = JSON.parse(readFileSync(mcpConfigPath, "utf8"));
+	} catch (error) {
+		failStartup(`failed to read --mcp-config: ${error.message}`);
+	}
+}
+if (process.env.PI_FAKE_EXPECT_MCP_CONFIG === "1") {
+	const servers = mcpConfig?.mcpServers;
+	if (
+		servers?.["stdio-tools"]?.command !== "/bin/echo" ||
+		servers?.["stdio-tools"]?.args?.[0] !== "mcp" ||
+		servers?.["stdio-tools"]?.env?.TOKEN !== "secret" ||
+		servers?.["http-tools"]?.url !== "http://127.0.0.1:65535/mcp" ||
+		servers?.["http-tools"]?.headers?.Authorization !== "Bearer test"
+	) {
+		failStartup("missing or invalid --mcp-config");
+	}
+}
 
 const MODELS = [
 	{ id: "m1", name: "Model One", provider: "prov" },

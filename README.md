@@ -14,7 +14,7 @@ so the adapter layer costs almost nothing. Measured head-to-head at the ACP `ini
 (`node scripts/bench-compare.mjs`, Apple M-series, medians):
 
 | Adapter | Architecture | Cold start | Resident memory |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | **pi-acpinator** | **Rust native binary, spawns `pi`** | **~4 ms** | **~3 MiB** |
 | [`pi-acp`](https://github.com/svkozak/pi-acp) (svkozak, 472★) | Node, spawns `pi` | ~100 ms | ~76 MiB |
 | [`@victor-software-house/pi-acp`](https://github.com/victor-software-house/pi-acp) | Bun, **embeds the pi SDK** in a persistent daemon | ~22 ms¹ | **~194 MiB**¹ |
@@ -52,7 +52,8 @@ Working today (live-verified against real pi):
 - `initialize` handshake; advertises `load_session` (no auth method — pi provider keys are
   configured externally via the pi CLI)
 - `session/new` — spawns and supervises a persistent `pi --mode rpc` session; advertises
-  pi's thinking levels (`off`..`xhigh`) as session modes and pi's models as a config option
+  pi's thinking levels (`off`..`xhigh`) as session modes and pi's models as a config option;
+  forwards ACP `mcpServers` to pi through a per-session `--mcp-config` file
 - `session/prompt` — streams assistant output + reasoning as `agent_message_chunk` /
   `agent_thought_chunk`, coalescing delta bursts into far fewer frames; forwards image
   content blocks to pi
@@ -81,6 +82,7 @@ npx pi-acpinator
 # or from source
 cargo install pi-acpinator     # from crates.io
 cargo build --release          # from a checkout -> target/release/pi-acpinator
+cargo build --release --no-default-features  # compile out MCP passthrough
 ```
 
 ## Use with an ACP client (Zed)
@@ -106,6 +108,7 @@ your model provider / API key.
 
 ```bash
 cargo test                    # unit + transport tests (framing, translation, coalescing, correlation)
+cargo test --no-default-features  # verifies the no-MCP-passthrough build
 node scripts/component-test.mjs   # end-to-end component test against a scripted fake pi (no model)
 node scripts/bench.mjs            # performance benchmarks (deterministic)
 node scripts/bench-compare.mjs    # head-to-head vs other pi ACP adapters (installs them)

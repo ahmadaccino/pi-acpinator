@@ -7,6 +7,7 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 ### Added
+
 - ACP agent over stdio that spawns and drives `pi --mode rpc`.
 - `initialize` (advertises `load_session`), `session/new`, `session/prompt`,
   `session/cancel` (`StopReason::Cancelled`).
@@ -20,6 +21,8 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   validated).
 - `session/load` — resume a persisted session and replay its history; reuses a
   live session instead of spawning a second pi.
+- ACP `mcpServers` passthrough to pi's MCP adapter via a per-session temp
+  `--mcp-config` file, behind the default `mcp-passthrough` Cargo feature.
 - Bounded pi stdin/event channels for backpressure; fails a turn if pi exits early.
 
 [Unreleased]: https://github.com/ahmadaccino/pi-acpinator
